@@ -1,4 +1,28 @@
 #!/usr/bin/env bash
+# ============================================================
+#  说明: MySQL/MariaDB 主从复制配置脚本
+#  作者: RobertHU
+#  日期: 2023-05-09
+#
+#  用法: sudo ./setup_mysql_replication.sh
+#        或设置环境变量: MYSQL_ROOT_PASSWORD="pwd" sudo ./setup_mysql_replication.sh
+#
+#  支持的 Linux 发行版:
+#    - Ubuntu 18.04 / 20.04 / 22.04 / 24.04 LTS
+#    - Debian 10 (Buster) / 11 (Bullseye) / 12 (Bookworm)
+#    - CentOS 7 / 8 / Stream 8 / Stream 9
+#    - RHEL 7 / 8 / 9 / 10
+#    - Rocky Linux 8 / 9 / 10
+#    - AlmaLinux 8 / 9
+#
+#  支持的数据库版本:
+#    - MySQL 5.7.x / 8.0.x / 8.4.x
+#    - MariaDB 10.3.x / 10.5.x / 10.6.x / 10.11.x / 11.x
+#
+#  功能:
+#    - 配置主库 (master): 设置 server_id, binlog, 创建复制用户
+#    - 配置从库 (slave): 设置 server_id, relay_log, 启动复制
+# ============================================================
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then

@@ -6,13 +6,23 @@
 #  用法: sudo ./install_mysql.sh
 #        或设置环境变量: MYSQL_ROOT_PASSWORD="pwd" sudo ./install_mysql.sh
 #
-#  支持系统: Debian/Ubuntu (apt), RHEL/CentOS/Rocky (dnf/yum)
+#  支持的 Linux 发行版:
+#    - Ubuntu 18.04 / 20.04 / 22.04 / 24.04 LTS
+#    - Debian 10 (Buster) / 11 (Bullseye) / 12 (Bookworm)
+#    - CentOS 7 / 8 / Stream 8 / Stream 9
+#    - RHEL 7 / 8 / 9 / 10
+#    - Rocky Linux 8 / 9 / 10
+#    - AlmaLinux 8 / 9
+#
+#  支持的数据库版本:
+#    - MySQL 5.7.x / 8.0.x / 8.4.x
+#    - MariaDB 10.3.x / 10.5.x / 10.6.x / 10.11.x / 11.x
 #
 #  配置流程:
 #    1/7 - 环境检测与安装: 检测包管理器，安装 MySQL/MariaDB
 #    2/7 - 服务检测与启动: 检测服务名(mysql/mysqld/mariadb)，启动服务
 #    3/7 - 网络访问配置: 设置 bind-address(本地/远程访问)
-#    4/7 - 性能参数配置: thread_concurrency, max_connections
+#    4/7 - 性能参数配置: max_connections 等
 #    5/7 - 存储引擎配置: InnoDB/MyISAM/MEMORY 引擎及其参数
 #    6/7 - 用户权限配置: root 访问权限、额外用户创建
 #    7/7 - 完成与验证: 重启服务，显示配置摘要
@@ -46,10 +56,8 @@ mysql_cli=()                  # mysql 命令行数组
 
 # 系统信息
 CPU_CORES=0                   # CPU 核数
-MAX_THREAD_CONCURRENCY=0      # 最大线程并发数
 
 # 用户输入变量
-thread_concurrency=""         # 线程并发数
 max_connections=""            # 最大连接数
 engine_choice=""              # 存储引擎选择
 
@@ -60,17 +68,13 @@ readonly DEFAULT_MAX_HEAP="64M"
 readonly DEFAULT_TMP_TABLE="64M"
 readonly DEFAULT_READ_BUFFER="128K"
 readonly DEFAULT_READ_RND_BUFFER="256K"
-readonly DEFAULT_LOG_FILE_SIZE="1G"
 readonly DEFAULT_FLUSH_AT_TRX_COMMIT="1"
 readonly DEFAULT_FILE_PER_TABLE="1"
 readonly DEFAULT_FLUSH_METHOD="O_DIRECT"
 readonly DEFAULT_IO_CAPACITY="200"
 readonly DEFAULT_IO_CAPACITY_MAX="2000"
-readonly DEFAULT_FLUSH_LOG_TIMEOUT="1"
 readonly DEFAULT_LOCK_WAIT_TIMEOUT="50"
-readonly DEFAULT_ADAPTIVE_HASH="1"
 readonly DEFAULT_SORT_BUFFER_SIZE="256M"
-readonly DEFAULT_TABLE_LOCKS="ON"
 
 # ---------------------- 输出辅助函数 ----------------------
 
@@ -278,13 +282,6 @@ set_bind_address() {
   set_config_value bind-address "$ip"
 }
 
-# set_thread_concurrency: 设置线程并发数
-# 建议值: CPU 核数 * 2
-set_thread_concurrency() {
-  local value="$1"
-  set_config_value thread_concurrency "$value"
-}
-
 # set_storage_engine: 设置默认存储引擎
 # 可选: InnoDB(推荐), MyISAM, MEMORY
 set_storage_engine() {
@@ -321,31 +318,8 @@ fi
 
 print_section "4/7 性能参数配置"
 
-# ---------------------- 线程并发配置 ----------------------
+# 获取 CPU 核数（用于计算 IO 线程默认值）
 CPU_CORES=$(nproc)
-MAX_THREAD_CONCURRENCY=$((CPU_CORES * 2))
-
-print_subsection "线程并发配置"
-print_info "CPU 核数: $CPU_CORES"
-echo "默认[推荐]：$MAX_THREAD_CONCURRENCY[CPU 核数的 2 倍]。自定义值必须小于 $MAX_THREAD_CONCURRENCY。"
-read -rp "请输入 thread_concurrency[< $MAX_THREAD_CONCURRENCY]，回车使用默认: " tc_input
-
-if [[ -n "${tc_input:-}" ]]; then
-  if ! [[ "$tc_input" =~ ^[0-9]+$ ]]; then
-    print_error "thread_concurrency 必须是数字。"
-    exit 1
-  fi
-  if (( tc_input <= 0 || tc_input >= MAX_THREAD_CONCURRENCY )); then
-    print_error "thread_concurrency 需大于 0 且小于 $MAX_THREAD_CONCURRENCY。"
-    exit 1
-  fi
-  thread_concurrency="$tc_input"
-else
-  thread_concurrency="$MAX_THREAD_CONCURRENCY"
-fi
-
-set_thread_concurrency "$thread_concurrency"
-print_success "thread_concurrency 已设置为: $thread_concurrency"
 
 # ---------------------- 最大连接数配置 ----------------------
 # max_connections: 同时允许的最大客户端连接数
@@ -415,18 +389,10 @@ case "$engine_choice" in
     print_info "回车使用默认值"
     echo
 
-    # 缓冲池大小 - 核心性能参数
     read -rp "innodb_buffer_pool_size[建议物理内存的 60%-80%，默认: $default_buffer_pool]: " bp_input
     innodb_buffer_pool_size="${bp_input:-$default_buffer_pool}"
     if ! validate_size_format "$innodb_buffer_pool_size"; then
       print_error "innodb_buffer_pool_size 格式无效，请用数字加可选 K/M/G 后缀。"
-      exit 1
-    fi
-
-    read -rp "innodb_log_file_size[典型 256M-1G，默认: $DEFAULT_LOG_FILE_SIZE]: " log_input
-    innodb_log_file_size="${log_input:-$DEFAULT_LOG_FILE_SIZE}"
-    if ! validate_size_format "$innodb_log_file_size"; then
-      print_error "innodb_log_file_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
@@ -488,13 +454,6 @@ case "$engine_choice" in
       exit 1
     fi
 
-    read -rp "innodb_flush_log_at_timeout[默认: $DEFAULT_FLUSH_LOG_TIMEOUT]: " flush_timeout_input
-    innodb_flush_log_at_timeout="${flush_timeout_input:-$DEFAULT_FLUSH_LOG_TIMEOUT}"
-    if ! [[ "$innodb_flush_log_at_timeout" =~ ^[0-9]+$ ]] || (( innodb_flush_log_at_timeout <= 0 )); then
-      print_error "innodb_flush_log_at_timeout 必须为正整数。"
-      exit 1
-    fi
-
     read -rp "innodb_lock_wait_timeout[默认: $DEFAULT_LOCK_WAIT_TIMEOUT]: " lock_timeout_input
     innodb_lock_wait_timeout="${lock_timeout_input:-$DEFAULT_LOCK_WAIT_TIMEOUT}"
     if ! [[ "$innodb_lock_wait_timeout" =~ ^[0-9]+$ ]] || (( innodb_lock_wait_timeout <= 0 )); then
@@ -502,33 +461,15 @@ case "$engine_choice" in
       exit 1
     fi
 
-    read -rp "innodb_adaptive_hash_index [0/1][默认: $DEFAULT_ADAPTIVE_HASH]: " ahi_input
-    innodb_adaptive_hash_index="${ahi_input:-$DEFAULT_ADAPTIVE_HASH}"
-    if ! [[ "$innodb_adaptive_hash_index" =~ ^[01]$ ]]; then
-      print_error "innodb_adaptive_hash_index 只能为 0 或 1。"
-      exit 1
-    fi
-
-    read -rp "innodb_sort_buffer_size[默认: $DEFAULT_SORT_BUFFER_SIZE]: " sort_buffer_input
+    read -rp "sort_buffer_size[默认: $DEFAULT_SORT_BUFFER_SIZE]: " sort_buffer_input
     innodb_sort_buffer_size="${sort_buffer_input:-$DEFAULT_SORT_BUFFER_SIZE}"
     if ! validate_size_format "$innodb_sort_buffer_size"; then
       print_error "innodb_sort_buffer_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
-    read -rp "innodb_table_locks [ON/OFF][默认: $DEFAULT_TABLE_LOCKS]: " table_locks_input
-    innodb_table_locks="${table_locks_input:-$DEFAULT_TABLE_LOCKS}"
-    innodb_table_locks_upper=${innodb_table_locks^^}
-    case "$innodb_table_locks_upper" in
-      ON|OFF|1|0) ;;
-      *)
-        print_error "innodb_table_locks 只能为 ON/OFF/1/0。"
-        exit 1
-        ;;
-    esac
-
+    # 应用 InnoDB 配置
     set_config_value innodb_buffer_pool_size "$innodb_buffer_pool_size"
-    set_config_value innodb_log_file_size "$innodb_log_file_size"
     set_config_value innodb_flush_log_at_trx_commit "$flush_trx"
     set_config_value innodb_file_per_table "$file_per_table"
     set_config_value innodb_flush_method "$flush_method_upper"
@@ -536,11 +477,8 @@ case "$engine_choice" in
     set_config_value innodb_write_io_threads "$innodb_write_io_threads"
     set_config_value innodb_io_capacity "$innodb_io_capacity"
     set_config_value innodb_io_capacity_max "$innodb_io_capacity_max"
-    set_config_value innodb_flush_log_at_timeout "$innodb_flush_log_at_timeout"
     set_config_value innodb_lock_wait_timeout "$innodb_lock_wait_timeout"
-    set_config_value innodb_adaptive_hash_index "$innodb_adaptive_hash_index"
-    set_config_value innodb_sort_buffer_size "$innodb_sort_buffer_size"
-    set_config_value innodb_table_locks "$innodb_table_locks_upper"
+    set_config_value sort_buffer_size "$innodb_sort_buffer_size"
     print_success "InnoDB 参数配置完成"
     ;;
   MYISAM)
