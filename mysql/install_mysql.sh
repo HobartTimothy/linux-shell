@@ -31,10 +31,48 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color - 重置颜色
 
+# ---------------------- 全局变量声明 ----------------------
+# 包管理器相关
+PKG_MGR=""                    # 包管理器类型: apt/dnf/yum
+UPDATE_CMD=""                 # 更新缓存命令
+INSTALL_CMD=""                # 安装包命令
+
+# 服务相关
+MYSQL_SERVICE="mysql"         # 服务名: mysql/mysqld/mariadb
+CONFIG_FILE=""                # 配置文件路径
+
+# MySQL 客户端连接
+mysql_cli=()                  # mysql 命令行数组
+
+# 系统信息
+CPU_CORES=0                   # CPU 核数
+MAX_THREAD_CONCURRENCY=0      # 最大线程并发数
+
+# 用户输入变量
+thread_concurrency=""         # 线程并发数
+max_connections=""            # 最大连接数
+engine_choice=""              # 存储引擎选择
+
+# 默认值常量
+readonly DEFAULT_MAX_CONNECTIONS="200"
+readonly DEFAULT_ENGINE="InnoDB"
+readonly DEFAULT_MAX_HEAP="64M"
+readonly DEFAULT_TMP_TABLE="64M"
+readonly DEFAULT_READ_BUFFER="128K"
+readonly DEFAULT_READ_RND_BUFFER="256K"
+readonly DEFAULT_LOG_FILE_SIZE="1G"
+readonly DEFAULT_FLUSH_AT_TRX_COMMIT="1"
+readonly DEFAULT_FILE_PER_TABLE="1"
+readonly DEFAULT_FLUSH_METHOD="O_DIRECT"
+readonly DEFAULT_IO_CAPACITY="200"
+readonly DEFAULT_IO_CAPACITY_MAX="2000"
+readonly DEFAULT_FLUSH_LOG_TIMEOUT="1"
+readonly DEFAULT_LOCK_WAIT_TIMEOUT="50"
+readonly DEFAULT_ADAPTIVE_HASH="1"
+readonly DEFAULT_SORT_BUFFER_SIZE="256M"
+readonly DEFAULT_TABLE_LOCKS="ON"
+
 # ---------------------- 输出辅助函数 ----------------------
-# print_section: 打印主要步骤标题(双线边框)
-# print_subsection: 打印子步骤标题(单线边框)
-# print_success/info/warning/error: 带颜色的状态信息
 
 # 打印分隔线和标题
 print_section() {
@@ -81,11 +119,6 @@ fi
 print_section "1/7 环境检测与安装"
 
 # ---------------------- 包管理器检测 ----------------------
-# 支持: apt(Debian/Ubuntu), dnf(RHEL8+/Fedora), yum(RHEL7/CentOS7)
-PKG_MGR=""
-UPDATE_CMD=""
-INSTALL_CMD=""
-MYSQL_SERVICE="mysql"  # 默认服务名，后续会自动检测
 
 if command -v apt-get >/dev/null 2>&1; then
   PKG_MGR="apt"
@@ -219,6 +252,8 @@ fi
 
 # 构建 mysql 命令行数组，用于后续 SQL 操作
 mysql_cli=(mysql --protocol=socket -uroot)
+
+mysql_cli=(mysql --protocol=socket -uroot)
 if [[ -n "${MYSQL_ROOT_PASSWORD:-}" ]]; then
   mysql_cli+=("-p${MYSQL_ROOT_PASSWORD}")
 fi
@@ -287,8 +322,6 @@ fi
 print_section "4/7 性能参数配置"
 
 # ---------------------- 线程并发配置 ----------------------
-# thread_concurrency: 并发线程数
-# 建议值: CPU 核数 * 2
 CPU_CORES=$(nproc)
 MAX_THREAD_CONCURRENCY=$((CPU_CORES * 2))
 
@@ -322,14 +355,13 @@ print_success "thread_concurrency 已设置为: $thread_concurrency"
 #   - Max_used_connections/max_connections > 85% : 需要提升
 print_subsection "最大连接数配置"
 
-default_max_connections="200"
 open_files_limit_info=$("${mysql_cli[@]}" --silent --skip-column-names --execute "SHOW VARIABLES LIKE 'open_files_limit';" 2>/dev/null | awk 'NR==1{print $2}')
 echo "最大连接数配置[过大可能导致内存耗尽；经验：Max_used_connections/max_connections <10% 可能过大，>85% 需考虑提升]。"
 if [[ -n "${open_files_limit_info:-}" ]]; then
   echo "当前 MySQL open_files_limit: $open_files_limit_info[需 >= max_connections]。"
 fi
-read -rp "请输入 max_connections[默认: $default_max_connections]: " max_conn_input
-max_connections="${max_conn_input:-$default_max_connections}"
+read -rp "请输入 max_connections[默认: $DEFAULT_MAX_CONNECTIONS]: " max_conn_input
+max_connections="${max_conn_input:-$DEFAULT_MAX_CONNECTIONS}"
 if ! [[ "$max_connections" =~ ^[0-9]+$ ]] || (( max_connections <= 0 )); then
   print_error "max_connections 必须为正整数。"
   exit 1
@@ -340,9 +372,6 @@ print_success "max_connections 已设置为: $max_connections"
 print_section "5/7 存储引擎配置"
 
 # ---------------------- 存储引擎选择 ----------------------
-# InnoDB:  支持事务、行级锁、崩溃恢复(推荐)
-# MyISAM:  表级锁、无事务、读性能好
-# MEMORY:  数据存内存、极快但重启丢失
 cat <<'EOF'
 存储引擎选项：
 - InnoDB : 支持事务/行级锁/崩溃恢复[推荐]。
@@ -359,9 +388,8 @@ cat <<'EOF'
 支持外键           No       No       Yes      No
 EOF
 
-default_engine="InnoDB"
-read -rp "请选择存储引擎 [InnoDB/MyISAM/MEMORY][默认: ${default_engine}]: " engine_input
-engine_choice=${engine_input:-$default_engine}
+read -rp "请选择存储引擎 [InnoDB/MyISAM/MEMORY][默认: ${DEFAULT_ENGINE}]: " engine_input
+engine_choice=${engine_input:-$DEFAULT_ENGINE}
 engine_choice=${engine_choice^^}
 
 case "$engine_choice" in
@@ -369,35 +397,20 @@ case "$engine_choice" in
     set_storage_engine "$engine_choice"
     print_success "已选择 InnoDB 引擎"
 
-    # -------------------- InnoDB 参数调优 --------------------
-    # innodb_buffer_pool_size: InnoDB 缓冲池大小，建议物理内存的60%-80%
-    # innodb_log_file_size: 日志文件大小，影响崩溃恢复时间
-    # innodb_flush_log_at_trx_commit: 事务提交时日志刷新策略
-    #   1=每次提交刷新(最安全) 2=每秒刷新 0=由OS决定(最快)
     print_subsection "InnoDB 参数调优"
 
+    # 计算动态默认值
     mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo || true)
     if [[ -n "${mem_kb:-}" && "$mem_kb" =~ ^[0-9]+$ ]]; then
       default_buffer_pool="$((mem_kb * 75 / 100 / 1024))M"
     else
       default_buffer_pool="1G"
     fi
-    default_log_file_size="1G"
-    default_flush_at_trx_commit="1"
-    default_file_per_table="1"
-    default_flush_method="O_DIRECT"
     if [[ "${CPU_CORES:-}" =~ ^[0-9]+$ && "$CPU_CORES" -gt 0 ]]; then
       default_io_threads=$(( CPU_CORES > 4 ? CPU_CORES : 4 ))
     else
       default_io_threads=4
     fi
-    default_io_capacity="200"
-    default_io_capacity_max="2000"
-    default_flush_log_timeout="1"
-    default_lock_wait_timeout="50"
-    default_adaptive_hash="1"
-    default_sort_buffer_size="256M"
-    default_table_locks="ON"
 
     print_info "回车使用默认值"
     echo
@@ -410,33 +423,29 @@ case "$engine_choice" in
       exit 1
     fi
 
-    # 日志文件大小
-    read -rp "innodb_log_file_size[典型 256M-1G，默认: $default_log_file_size]: " log_input
-    innodb_log_file_size="${log_input:-$default_log_file_size}"
+    read -rp "innodb_log_file_size[典型 256M-1G，默认: $DEFAULT_LOG_FILE_SIZE]: " log_input
+    innodb_log_file_size="${log_input:-$DEFAULT_LOG_FILE_SIZE}"
     if ! validate_size_format "$innodb_log_file_size"; then
       print_error "innodb_log_file_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
-    # 事务提交时日志刷新策略: 1=最安全 2=每秒 0=OS决定
-    read -rp "innodb_flush_log_at_trx_commit [0/1/2][默认: $default_flush_at_trx_commit]: " flush_trx_input
-    flush_trx="${flush_trx_input:-$default_flush_at_trx_commit}"
+    read -rp "innodb_flush_log_at_trx_commit [0/1/2][默认: $DEFAULT_FLUSH_AT_TRX_COMMIT]: " flush_trx_input
+    flush_trx="${flush_trx_input:-$DEFAULT_FLUSH_AT_TRX_COMMIT}"
     if ! [[ "$flush_trx" =~ ^[0-2]$ ]]; then
       print_error "innodb_flush_log_at_trx_commit 只能为 0/1/2。"
       exit 1
     fi
 
-    # 每表独立表空间: 1=启用(推荐) 0=共享表空间
-    read -rp "innodb_file_per_table [0/1][默认: $default_file_per_table]: " fpt_input
-    file_per_table="${fpt_input:-$default_file_per_table}"
+    read -rp "innodb_file_per_table [0/1][默认: $DEFAULT_FILE_PER_TABLE]: " fpt_input
+    file_per_table="${fpt_input:-$DEFAULT_FILE_PER_TABLE}"
     if ! [[ "$file_per_table" =~ ^[01]$ ]]; then
       print_error "innodb_file_per_table 只能为 0 或 1。"
       exit 1
     fi
 
-    # 数据刷新方式: O_DIRECT=绕过OS缓存 fsync=标准 O_DSYNC=同步IO
-    read -rp "innodb_flush_method [O_DIRECT/fsync/O_DSYNC][默认: $default_flush_method]: " fm_input
-    flush_method="${fm_input:-$default_flush_method}"
+    read -rp "innodb_flush_method [O_DIRECT/fsync/O_DSYNC][默认: $DEFAULT_FLUSH_METHOD]: " fm_input
+    flush_method="${fm_input:-$DEFAULT_FLUSH_METHOD}"
     flush_method_upper=${flush_method^^}
     case "$flush_method_upper" in
       O_DIRECT|FSYNC|O_DSYNC) ;;
@@ -446,7 +455,7 @@ case "$engine_choice" in
         ;;
     esac
 
-    # IO 线程数 - 影响并发 IO 性能
+    # IO 线程数
     read -rp "innodb_read_io_threads[默认: $default_io_threads]: " read_io_input
     innodb_read_io_threads="${read_io_input:-$default_io_threads}"
     if ! [[ "$innodb_read_io_threads" =~ ^[0-9]+$ ]] || (( innodb_read_io_threads <= 0 )); then
@@ -461,15 +470,15 @@ case "$engine_choice" in
       exit 1
     fi
 
-    read -rp "innodb_io_capacity[默认: $default_io_capacity]: " io_cap_input
-    innodb_io_capacity="${io_cap_input:-$default_io_capacity}"
+    read -rp "innodb_io_capacity[默认: $DEFAULT_IO_CAPACITY]: " io_cap_input
+    innodb_io_capacity="${io_cap_input:-$DEFAULT_IO_CAPACITY}"
     if ! [[ "$innodb_io_capacity" =~ ^[0-9]+$ ]] || (( innodb_io_capacity <= 0 )); then
       print_error "innodb_io_capacity 必须为正整数。"
       exit 1
     fi
 
-    read -rp "innodb_io_capacity_max[默认: $default_io_capacity_max]: " io_cap_max_input
-    innodb_io_capacity_max="${io_cap_max_input:-$default_io_capacity_max}"
+    read -rp "innodb_io_capacity_max[默认: $DEFAULT_IO_CAPACITY_MAX]: " io_cap_max_input
+    innodb_io_capacity_max="${io_cap_max_input:-$DEFAULT_IO_CAPACITY_MAX}"
     if ! [[ "$innodb_io_capacity_max" =~ ^[0-9]+$ ]] || (( innodb_io_capacity_max <= 0 )); then
       print_error "innodb_io_capacity_max 必须为正整数。"
       exit 1
@@ -479,36 +488,36 @@ case "$engine_choice" in
       exit 1
     fi
 
-    read -rp "innodb_flush_log_at_timeout[默认: $default_flush_log_timeout]: " flush_timeout_input
-    innodb_flush_log_at_timeout="${flush_timeout_input:-$default_flush_log_timeout}"
+    read -rp "innodb_flush_log_at_timeout[默认: $DEFAULT_FLUSH_LOG_TIMEOUT]: " flush_timeout_input
+    innodb_flush_log_at_timeout="${flush_timeout_input:-$DEFAULT_FLUSH_LOG_TIMEOUT}"
     if ! [[ "$innodb_flush_log_at_timeout" =~ ^[0-9]+$ ]] || (( innodb_flush_log_at_timeout <= 0 )); then
       print_error "innodb_flush_log_at_timeout 必须为正整数。"
       exit 1
     fi
 
-    read -rp "innodb_lock_wait_timeout[默认: $default_lock_wait_timeout]: " lock_timeout_input
-    innodb_lock_wait_timeout="${lock_timeout_input:-$default_lock_wait_timeout}"
+    read -rp "innodb_lock_wait_timeout[默认: $DEFAULT_LOCK_WAIT_TIMEOUT]: " lock_timeout_input
+    innodb_lock_wait_timeout="${lock_timeout_input:-$DEFAULT_LOCK_WAIT_TIMEOUT}"
     if ! [[ "$innodb_lock_wait_timeout" =~ ^[0-9]+$ ]] || (( innodb_lock_wait_timeout <= 0 )); then
       print_error "innodb_lock_wait_timeout 必须为正整数。"
       exit 1
     fi
 
-    read -rp "innodb_adaptive_hash_index [0/1][默认: $default_adaptive_hash]: " ahi_input
-    innodb_adaptive_hash_index="${ahi_input:-$default_adaptive_hash}"
+    read -rp "innodb_adaptive_hash_index [0/1][默认: $DEFAULT_ADAPTIVE_HASH]: " ahi_input
+    innodb_adaptive_hash_index="${ahi_input:-$DEFAULT_ADAPTIVE_HASH}"
     if ! [[ "$innodb_adaptive_hash_index" =~ ^[01]$ ]]; then
       print_error "innodb_adaptive_hash_index 只能为 0 或 1。"
       exit 1
     fi
 
-    read -rp "innodb_sort_buffer_size[默认: $default_sort_buffer_size]: " sort_buffer_input
-    innodb_sort_buffer_size="${sort_buffer_input:-$default_sort_buffer_size}"
+    read -rp "innodb_sort_buffer_size[默认: $DEFAULT_SORT_BUFFER_SIZE]: " sort_buffer_input
+    innodb_sort_buffer_size="${sort_buffer_input:-$DEFAULT_SORT_BUFFER_SIZE}"
     if ! validate_size_format "$innodb_sort_buffer_size"; then
       print_error "innodb_sort_buffer_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
-    read -rp "innodb_table_locks [ON/OFF][默认: $default_table_locks]: " table_locks_input
-    innodb_table_locks="${table_locks_input:-$default_table_locks}"
+    read -rp "innodb_table_locks [ON/OFF][默认: $DEFAULT_TABLE_LOCKS]: " table_locks_input
+    innodb_table_locks="${table_locks_input:-$DEFAULT_TABLE_LOCKS}"
     innodb_table_locks_upper=${innodb_table_locks^^}
     case "$innodb_table_locks_upper" in
       ON|OFF|1|0) ;;
@@ -539,19 +548,15 @@ case "$engine_choice" in
     print_success "已选择 MyISAM 引擎"
 
     # -------------------- MyISAM 参数调优 --------------------
-    # key_buffer_size: 索引缓冲区大小，建议占可用内存的25%
-    # read_buffer_size: 顺序读取缓冲区
-    # read_rnd_buffer_size: 随机读取缓冲区
     print_subsection "MyISAM 参数调优"
 
+    # 计算动态默认值
     mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo || true)
     if [[ -n "${mem_kb:-}" && "$mem_kb" =~ ^[0-9]+$ ]]; then
       default_key_buffer="$((mem_kb / 4 / 1024))M"
     else
       default_key_buffer="256M"
     fi
-    default_read_buffer="128K"
-    default_read_rnd_buffer="256K"
 
     read -rp "key_buffer_size[默认: $default_key_buffer]：建议约可用内存的 1/4: " key_buffer_input
     key_buffer_size="${key_buffer_input:-$default_key_buffer}"
@@ -560,15 +565,15 @@ case "$engine_choice" in
       exit 1
     fi
 
-    read -rp "read_buffer_size[默认: $default_read_buffer]: " read_buffer_input
-    read_buffer_size="${read_buffer_input:-$default_read_buffer}"
+    read -rp "read_buffer_size[默认: $DEFAULT_READ_BUFFER]: " read_buffer_input
+    read_buffer_size="${read_buffer_input:-$DEFAULT_READ_BUFFER}"
     if ! validate_size_format "$read_buffer_size"; then
       print_error "read_buffer_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
-    read -rp "read_rnd_buffer_size[默认: $default_read_rnd_buffer]: " read_rnd_buffer_input
-    read_rnd_buffer_size="${read_rnd_buffer_input:-$default_read_rnd_buffer}"
+    read -rp "read_rnd_buffer_size[默认: $DEFAULT_READ_RND_BUFFER]: " read_rnd_buffer_input
+    read_rnd_buffer_size="${read_rnd_buffer_input:-$DEFAULT_READ_RND_BUFFER}"
     if ! validate_size_format "$read_rnd_buffer_size"; then
       print_error "read_rnd_buffer_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
@@ -584,26 +589,20 @@ case "$engine_choice" in
     print_success "已选择 MEMORY 引擎"
 
     # -------------------- MEMORY 参数调优 --------------------
-    # max_heap_table_size: 单个 MEMORY 表最大大小
-    # tmp_table_size: 内部临时表最大大小
-    # 注意: 建议两者保持一致，避免临时表落盘
     print_subsection "MEMORY 参数调优"
-
-    default_max_heap="64M"
-    default_tmp_table="64M"
 
     print_info "建议 max_heap_table_size 与 tmp_table_size 保持一致，避免临时表落盘"
     echo
 
-    read -rp "max_heap_table_size[每张 MEMORY 表上限，默认: $default_max_heap]: " max_heap_input
-    max_heap_table_size="${max_heap_input:-$default_max_heap}"
+    read -rp "max_heap_table_size[每张 MEMORY 表上限，默认: $DEFAULT_MAX_HEAP]: " max_heap_input
+    max_heap_table_size="${max_heap_input:-$DEFAULT_MAX_HEAP}"
     if ! validate_size_format "$max_heap_table_size"; then
       print_error "max_heap_table_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
-    read -rp "tmp_table_size[内部内存临时表上限，默认: $default_tmp_table]: " tmp_table_input
-    tmp_table_size="${tmp_table_input:-$default_tmp_table}"
+    read -rp "tmp_table_size[内部内存临时表上限，默认: $DEFAULT_TMP_TABLE]: " tmp_table_input
+    tmp_table_size="${tmp_table_input:-$DEFAULT_TMP_TABLE}"
     if ! validate_size_format "$tmp_table_size"; then
       print_error "tmp_table_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
