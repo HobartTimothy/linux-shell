@@ -2,66 +2,123 @@
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
-  echo "请使用 root 运行（例如 sudo $0）" >&2
+  echo "请用 root 运行（例如 sudo $0）" >&2
   exit 1
 fi
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y mysql-server
+# ---------- 安装与检测 ----------
+PKG_MGR=""
+UPDATE_CMD=""
+INSTALL_CMD=""
+MYSQL_SERVICE="mysql"
 
-# 确保 MySQL 开机自启并立即启动
-systemctl enable --now mysql
-
-# 若提供 MYSQL_ROOT_PASSWORD 则设置 root 密码
-if [[ -n "${MYSQL_ROOT_PASSWORD:-}" ]]; then
-  mysql --protocol=socket -uroot --execute="ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD//\'/'"'"'}'; FLUSH PRIVILEGES;"
-  echo "已根据环境变量 MYSQL_ROOT_PASSWORD 设置 root 密码。"
-fi
-
-# 配置文件地址
-CONFIG_FILE="/etc/mysql/mysql.conf.d/mysqld.cnf"
-
-if [[ ! -f "$CONFIG_FILE" ]]; then
-  echo "未找到 MySQL 配置文件：$CONFIG_FILE" >&2
+if command -v apt-get >/dev/null 2>&1; then
+  PKG_MGR="apt"
+  UPDATE_CMD="apt-get update -y"
+  INSTALL_CMD="apt-get install -y"
+elif command -v dnf >/dev/null 2>&1; then
+  PKG_MGR="dnf"
+  UPDATE_CMD="dnf makecache -y"
+  INSTALL_CMD="dnf install -y"
+elif command -v yum >/dev/null 2>&1; then
+  PKG_MGR="yum"
+  UPDATE_CMD="yum makecache -y"
+  INSTALL_CMD="yum install -y"
+else
+  echo "未检测到受支持的包管理器（apt/dnf/yum），请手动安装 MySQL。" >&2
   exit 1
 fi
 
-set_bind_address() {
-  local ip="$1"
-  if grep -Eq '^[#[:space:]]*bind-address[[:space:]]*=' "$CONFIG_FILE"; then
-    sed -i "s/^[#[:space:]]*bind-address[[:space:]]*=.*/bind-address = $ip/" "$CONFIG_FILE"
+install_mysql() {
+  if [[ "$PKG_MGR" == "apt" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    bash -c "$UPDATE_CMD"
+    bash -c "$INSTALL_CMD mysql-server"
   else
-    printf "\n[mysqld]\nbind-address = %s\n" "$ip" >> "$CONFIG_FILE"
+    bash -c "$UPDATE_CMD"
+    bash -c "$INSTALL_CMD mysql-server" || bash -c "$INSTALL_CMD mariadb-server"
   fi
 }
 
-set_thread_concurrency() {
-  local value="$1"
-  if grep -Eq '^[#[:space:]]*thread_concurrency[[:space:]]*=' "$CONFIG_FILE"; then
-    sed -i "s/^[#[:space:]]*thread_concurrency[[:space:]]*=.*/thread_concurrency = $value/" "$CONFIG_FILE"
-  else
-    printf "\n[mysqld]\nthread_concurrency = %s\n" "$value" >> "$CONFIG_FILE"
-  fi
+choose_config_file() {
+  for f in /etc/mysql/mysql.conf.d/mysqld.cnf /etc/my.cnf /etc/mysql/my.cnf; do
+    if [[ -f "$f" ]]; then
+      CONFIG_FILE="$f"
+      return
+    fi
+  done
+  CONFIG_FILE="/etc/my.cnf"
+  touch "$CONFIG_FILE"
+  echo "[mysqld]" >> "$CONFIG_FILE"
 }
 
-set_storage_engine() {
-  local engine="$1"
-  if grep -Eq '^[#[:space:]]*default_storage_engine[[:space:]]*=' "$CONFIG_FILE"; then
-    sed -i "s/^[#[:space:]]*default_storage_engine[[:space:]]*=.*/default_storage_engine = $engine/" "$CONFIG_FILE"
-  else
-    printf "\n[mysqld]\ndefault_storage_engine = %s\n" "$engine" >> "$CONFIG_FILE"
+ensure_mysqld_section() {
+  if ! grep -Eq '^\[mysqld\]' "$CONFIG_FILE"; then
+    printf "\n[mysqld]\n" >> "$CONFIG_FILE"
   fi
 }
 
 set_config_value() {
   local key="$1"
   local value="$2"
+  ensure_mysqld_section
   if grep -Eq "^[#[:space:]]*${key}[[:space:]]*=" "$CONFIG_FILE"; then
-    sed -i "s/^[#[:space:]]*${key}[[:space:]]*=.*/${key} = $value/" "$CONFIG_FILE"
+    sed -i "s/^[#[:space:]]*${key}[[:space:]]*=.*/${key} = ${value}/" "$CONFIG_FILE"
   else
-    printf "\n[mysqld]\n%s = %s\n" "$key" "$value" >> "$CONFIG_FILE"
+    printf "%s = %s\n" "$key" "$value" >> "$CONFIG_FILE"
   fi
+}
+
+escape_sql() {
+  local input="$1"
+  printf "%s" "${input//\'/'"'"'}"
+}
+
+install_mysql
+choose_config_file
+
+# 检测服务名
+if systemctl list-unit-files | grep -q '^mysqld.service'; then
+  MYSQL_SERVICE="mysqld"
+elif systemctl list-unit-files | grep -q '^mariadb.service'; then
+  MYSQL_SERVICE="mariadb"i
+
+# 确保 MySQL 开机自启并立即启动
+systemctl enable --now "$MYSQL_SERVICE"
+
+# 若提供 MYSQL_ROOT_PASSWORD 则设置 root 密码
+if [[ -n "${MYSQL_ROOT_PASSWORD:-}" ]]; then
+  mysql --protocol=socket -uroot --execute="ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD//\'/'"'"'}'; FLUSH PRIVILEGES;" || true
+  echo "已根据环境变量 MYSQL_ROOT_PASSWORD 设置/更新 root 密码。"
+fi
+
+mysql_cli=(mysql --protocol=socket -uroot)
+if [[ -n "${MYSQL_ROOT_PASSWORD:-}" ]]; then
+  mysql_cli+=("-p${MYSQL_ROOT_PASSWORD}")
+fi
+
+if ! "${mysql_cli[@]}" --execute "SELECT 1" >/dev/null 2>&1; then
+  read -rsp "请输入 MySQL root 密码（若已免密可直接回车）: " root_pwd
+  echo
+  if [[ -n "$root_pwd" ]]; then
+    mysql_cli=(mysql --protocol=socket -uroot "-p${root_pwd}")
+  fi
+fi
+
+# 配置函数
+set_bind_address() {
+  local ip="$1"
+  set_config_value bind-address "$ip"
+}
+
+set_thread_concurrency() {
+  local value="$1"
+  set_config_value thread_concurrency "$value"
+}
+
+set_storage_engine() {
+  local engine="$1"
+  set_config_value default_storage_engine "$engine"
 }
 
 validate_size_format() {
@@ -69,9 +126,9 @@ validate_size_format() {
   [[ "$size" =~ ^[0-9]+[KkMmGg]?$ ]]
 }
 
-mysql_cli=(mysql --protocol=socket -uroot)
-if [[ -n "${MYSQL_ROOT_PASSWORD:-}" ]]; then
-  mysql_cli+=("-p${MYSQL_ROOT_PASSWORD}")
+# 远程访问
+if [[ "$PKG_MGR" == "apt" ]]; then
+  set_config_value mysqlx-bind-address 127.0.0.1 || true
 fi
 
 echo "远程访问配置："
@@ -115,7 +172,7 @@ echo "thread_concurrency 已设置为: $thread_concurrency"
 
 default_max_connections="200"
 open_files_limit_info=$("${mysql_cli[@]}" --silent --skip-column-names --execute "SHOW VARIABLES LIKE 'open_files_limit';" 2>/dev/null | awk 'NR==1{print $2}')
-echo "最大连接数配置（过大可能导致内存耗尽；依据 Max_used_connections/max_connections 经验：<10% 可能过大，>85% 需考虑提升）。"
+echo "最大连接数配置（过大可能导致内存耗尽；经验：Max_used_connections/max_connections <10% 可能过大，>85% 需考虑提升）。"
 if [[ -n "${open_files_limit_info:-}" ]]; then
   echo "当前 MySQL open_files_limit: $open_files_limit_info（需 >= max_connections）。"
 fi
@@ -133,7 +190,6 @@ cat <<'EOF'
 - InnoDB : 支持事务/行级锁/崩溃恢复（推荐）。
 - MyISAM : 表级锁，无事务，读性能好。
 - MEMORY : 数据存内存，极快但不持久。
-
 存储引擎对比：
 功能               MyISAM   MEMORY   InnoDB   Archive
 存储限制           265TB    RAM      65TB     无明确限制
@@ -376,7 +432,9 @@ case "$engine_choice" in
     echo "存储引擎选择无效。可选: InnoDB, MyISAM, MEMORY。" >&2
     exit 1
     ;;
-esac
+  esac
+
+# root 远程登录与额外用户
 
 echo "root 远程登录配置："
 read -rp "是否允许 root 远程登录（host=%）? (y/N): " allow_root_remote
@@ -428,7 +486,7 @@ if [[ "${create_extra_user:-}" =~ ^[Yy]$ ]]; then
   echo "已创建用户 $new_user@$new_user_host 并授予权限。"
 fi
 
-systemctl restart mysql
+systemctl restart "$MYSQL_SERVICE"
 
 mysql --version
-systemctl is-active --quiet mysql && echo "MySQL 已运行。" || echo "MySQL 未运行。"
+systemctl is-active --quiet "$MYSQL_SERVICE" && echo "MySQL 已运行。" || echo "MySQL 未运行。"
