@@ -19,6 +19,7 @@ if [[ -n "${MYSQL_ROOT_PASSWORD:-}" ]]; then
   echo "已根据环境变量 MYSQL_ROOT_PASSWORD 设置 root 密码。"
 fi
 
+# 配置文件地址
 CONFIG_FILE="/etc/mysql/mysql.conf.d/mysqld.cnf"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
