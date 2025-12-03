@@ -6,9 +6,24 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-CONFIG_FILE="/etc/mysql/mysql.conf.d/mysqld.cnf"
-if [[ ! -f "$CONFIG_FILE" ]]; then
-  echo "未找到 MySQL 配置文件: $CONFIG_FILE" >&2
+# 检测服务名
+MYSQL_SERVICE="mysql"
+if systemctl list-unit-files 2>/dev/null | grep -q '^mysqld.service'; then
+  MYSQL_SERVICE="mysqld"
+elif systemctl list-unit-files 2>/dev/null | grep -q '^mariadb.service'; then
+  MYSQL_SERVICE="mariadb"
+fi
+
+# 查找配置文件
+CONFIG_FILE=""
+for f in /etc/mysql/mysql.conf.d/mysqld.cnf /etc/my.cnf /etc/mysql/my.cnf; do
+  if [[ -f "$f" ]]; then
+    CONFIG_FILE="$f"
+    break
+  fi
+done
+if [[ -z "$CONFIG_FILE" ]]; then
+  echo "未找到 MySQL 配置文件" >&2
   exit 1
 fi
 
@@ -24,7 +39,7 @@ set_config_value() {
 
 escape_sql() {
   local input="$1"
-  printf "%s" "${input//\'/'"'"'}"
+  printf "%s" "${input//\'/\'\'}"  
 }
 
 mysql_cli=(mysql --protocol=socket -uroot)
@@ -67,7 +82,7 @@ if [[ "$role" == "master" ]]; then
   set_config_value log_bin /var/log/mysql/mysql-bin.log
   set_config_value binlog_do_db "$db_name"
 
-  systemctl restart mysql
+  systemctl restart "$MYSQL_SERVICE"
 
   read -rp "复制用户名称（默认 repl）: " repl_user
   repl_user=${repl_user:-repl}
@@ -84,7 +99,7 @@ if [[ "$role" == "master" ]]; then
   repl_pass_esc=$(escape_sql "$repl_pass")
   repl_host_esc=$(escape_sql "$repl_host")
 
-  "${mysql_cli[@]}" --execute="CREATE USER IF NOT EXISTS '$repl_user_esc'@'$repl_host_esc' IDENTIFIED WITH mysql_native_password BY '$repl_pass_esc'; GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '$repl_user_esc'@'$repl_host_esc'; FLUSH PRIVILEGES;"
+  "${mysql_cli[@]}" --execute="CREATE USER IF NOT EXISTS '$repl_user_esc'@'$repl_host_esc' IDENTIFIED BY '$repl_pass_esc'; GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO '$repl_user_esc'@'$repl_host_esc'; FLUSH PRIVILEGES;"
 
   master_status=$("${mysql_cli[@]}" --batch --skip-column-names --execute="SHOW MASTER STATUS;" || true)
   master_file=$(echo "$master_status" | awk '{print $1}')
@@ -126,7 +141,7 @@ else
   set_config_value super_read_only 1
   set_config_value replicate_do_db "$db_name"
 
-  systemctl restart mysql
+  systemctl restart "$MYSQL_SERVICE"
 
   repl_user_esc=$(escape_sql "$repl_user")
   repl_pass_esc=$(escape_sql "$repl_pass")

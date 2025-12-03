@@ -1,16 +1,91 @@
+# ============================================================
+#  说明: MySQL/MariaDB 自动安装配置脚本
+#  作者: RobertHU 
+#  日期: 2023-05-09
+#
+#  用法: sudo ./install_mysql.sh
+#        或设置环境变量: MYSQL_ROOT_PASSWORD="pwd" sudo ./install_mysql.sh
+#
+#  支持系统: Debian/Ubuntu (apt), RHEL/CentOS/Rocky (dnf/yum)
+#
+#  配置流程:
+#    1/7 - 环境检测与安装: 检测包管理器，安装 MySQL/MariaDB
+#    2/7 - 服务检测与启动: 检测服务名(mysql/mysqld/mariadb)，启动服务
+#    3/7 - 网络访问配置: 设置 bind-address(本地/远程访问)
+#    4/7 - 性能参数配置: thread_concurrency, max_connections
+#    5/7 - 存储引擎配置: InnoDB/MyISAM/MEMORY 引擎及其参数
+#    6/7 - 用户权限配置: root 访问权限、额外用户创建
+#    7/7 - 完成与验证: 重启服务，显示配置摘要
+# ============================================================
+
 #!/usr/bin/env bash
+# 严格模式: -e 错误退出 | -u 未定义变量报错 | -o pipefail 管道失败传递
 set -euo pipefail
 
+# ---------------------- 终端颜色定义 ----------------------
+# 用于美化输出，区分不同类型的信息
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color - 重置颜色
+
+# ---------------------- 输出辅助函数 ----------------------
+# print_section: 打印主要步骤标题(双线边框)
+# print_subsection: 打印子步骤标题(单线边框)
+# print_success/info/warning/error: 带颜色的状态信息
+
+# 打印分隔线和标题
+print_section() {
+  local title="$1"
+  echo
+  echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
+  echo -e "${CYAN}  $title${NC}"
+  echo -e "${CYAN}═══════════════════════════════════════════════════════════${NC}"
+  echo
+}
+
+print_subsection() {
+  local title="$1"
+  echo
+  echo -e "${YELLOW}───────────────────────────────────────${NC}"
+  echo -e "${YELLOW}  $title${NC}"
+  echo -e "${YELLOW}───────────────────────────────────────${NC}"
+}
+
+print_success() {
+  echo -e "${GREEN}✓ $1${NC}"
+}
+
+print_info() {
+  echo -e "${BLUE}ℹ $1${NC}"
+}
+
+print_warning() {
+  echo -e "${YELLOW}⚠ $1${NC}"
+}
+
+print_error() {
+  echo -e "${RED}✗ $1${NC}" >&2
+}
+
+# ---------------------- 权限检查 ----------------------
+# 该脚本需要 root 权限执行
+
 if [[ $EUID -ne 0 ]]; then
-  echo "请用 root 运行（例如 sudo $0）" >&2
+  print_error "请使用 root 运行[例如 sudo $0]"
   exit 1
 fi
 
-# ---------- 安装与检测 ----------
+print_section "1/7 环境检测与安装"
+
+# ---------------------- 包管理器检测 ----------------------
+# 支持: apt(Debian/Ubuntu), dnf(RHEL8+/Fedora), yum(RHEL7/CentOS7)
 PKG_MGR=""
 UPDATE_CMD=""
 INSTALL_CMD=""
-MYSQL_SERVICE="mysql"
+MYSQL_SERVICE="mysql"  # 默认服务名，后续会自动检测
 
 if command -v apt-get >/dev/null 2>&1; then
   PKG_MGR="apt"
@@ -25,10 +100,16 @@ elif command -v yum >/dev/null 2>&1; then
   UPDATE_CMD="yum makecache -y"
   INSTALL_CMD="yum install -y"
 else
-  echo "未检测到受支持的包管理器（apt/dnf/yum），请手动安装 MySQL。" >&2
+  print_error "未检测到受支持的包管理器[apt/dnf/yum]，请手动安装 MySQL。"
   exit 1
 fi
 
+
+# ---------------------- 核心函数定义 ----------------------
+
+# install_mysql: 根据包管理器安装 MySQL/MariaDB
+# - apt 系统: 安装 mysql-server
+# - dnf/yum 系统: 优先尝试 mysql-server，失败则安装 mariadb-server
 install_mysql() {
   if [[ "$PKG_MGR" == "apt" ]]; then
     export DEBIAN_FRONTEND=noninteractive
@@ -40,6 +121,8 @@ install_mysql() {
   fi
 }
 
+# choose_config_file: 查找并设置 MySQL 配置文件路径
+# 优先级: /etc/mysql/mysql.conf.d/mysqld.cnf > /etc/my.cnf > /etc/mysql/my.cnf
 choose_config_file() {
   for f in /etc/mysql/mysql.conf.d/mysqld.cnf /etc/my.cnf /etc/mysql/my.cnf; do
     if [[ -f "$f" ]]; then
@@ -52,12 +135,16 @@ choose_config_file() {
   echo "[mysqld]" >> "$CONFIG_FILE"
 }
 
+# ensure_mysqld_section: 确保配置文件中存在 [mysqld] 段
 ensure_mysqld_section() {
   if ! grep -Eq '^\[mysqld\]' "$CONFIG_FILE"; then
     printf "\n[mysqld]\n" >> "$CONFIG_FILE"
   fi
 }
 
+# set_config_value: 设置或更新 MySQL 配置参数
+# 参数: $1=配置项名称, $2=配置值
+# 如果配置已存在则更新，否则追加到文件末尾
 set_config_value() {
   local key="$1"
   local value="$2"
@@ -69,97 +156,154 @@ set_config_value() {
   fi
 }
 
+# escape_sql: SQL 字符串转义，将单引号转为两个单引号
+# 防止 SQL 注入
 escape_sql() {
   local input="$1"
-  printf "%s" "${input//\'/'"'"'}"
+  printf "%s" "${input//\'/\'\'}"
 }
 
+# validate_size_format: 验证内存/存储大小格式
+# 支持格式: 数字 + 可选后缀(K/M/G)
+# 示例: 128M, 1G, 256K, 1024
+validate_size_format() {
+  local size="$1"
+  [[ "$size" =~ ^[0-9]+[KkMmGg]?$ ]]
+}
+
+# 执行安装并选择配置文件
+print_info "正在安装 MySQL/MariaDB..."
 install_mysql
 choose_config_file
+print_success "安装完成，配置文件: $CONFIG_FILE"
 
-# 检测服务名
-if systemctl list-unit-files | grep -q '^mysqld.service'; then
+print_section "2/7 服务检测与启动"
+
+# ---------------------- 服务名检测 ----------------------
+# 不同系统的服务名可能不同:
+# - mysql.service: Debian/Ubuntu 的 MySQL
+# - mysqld.service: RHEL/CentOS 的 MySQL
+# - mariadb.service: MariaDB (常见于 RHEL 系统)
+
+# 刷新 systemd 以识别新安装的服务
+systemctl daemon-reload 2>/dev/null || true
+
+if systemctl list-unit-files 2>/dev/null | grep -q 'mariadb.service'; then
+  MYSQL_SERVICE="mariadb"
+elif systemctl list-unit-files 2>/dev/null | grep -q 'mysqld.service'; then
   MYSQL_SERVICE="mysqld"
-elif systemctl list-unit-files | grep -q '^mariadb.service'; then
-  MYSQL_SERVICE="mariadb"i
+elif systemctl list-unit-files 2>/dev/null | grep -q 'mysql.service'; then
+  MYSQL_SERVICE="mysql"
+else
+  # 备用检测：直接检查服务文件
+  if [[ -f /usr/lib/systemd/system/mariadb.service ]] || [[ -f /etc/systemd/system/mariadb.service ]]; then
+    MYSQL_SERVICE="mariadb"
+  elif [[ -f /usr/lib/systemd/system/mysqld.service ]] || [[ -f /etc/systemd/system/mysqld.service ]]; then
+    MYSQL_SERVICE="mysqld"
+  fi
+fi
+
+print_info "检测到服务名: $MYSQL_SERVICE"
 
 # 确保 MySQL 开机自启并立即启动
 systemctl enable --now "$MYSQL_SERVICE"
+print_success "服务已启动并设置开机自启"
 
-# 若提供 MYSQL_ROOT_PASSWORD 则设置 root 密码
+# ---------------------- Root 密码设置 ----------------------
+# 如果设置了 MYSQL_ROOT_PASSWORD 环境变量，则使用该密码更新 root
+# 若提供 MYSQL_ROOT_PASSWORD 则设置/更新 root 密码
 if [[ -n "${MYSQL_ROOT_PASSWORD:-}" ]]; then
-  mysql --protocol=socket -uroot --execute="ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD//\'/'"'"'}'; FLUSH PRIVILEGES;" || true
-  echo "已根据环境变量 MYSQL_ROOT_PASSWORD 设置/更新 root 密码。"
+  mysql --protocol=socket -uroot --execute="ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD//\'/\'\'}'; FLUSH PRIVILEGES;" || true
+  print_success "已根据环境变量 MYSQL_ROOT_PASSWORD 设置/更新 root 密码"
 fi
 
+# 构建 mysql 命令行数组，用于后续 SQL 操作
 mysql_cli=(mysql --protocol=socket -uroot)
 if [[ -n "${MYSQL_ROOT_PASSWORD:-}" ]]; then
   mysql_cli+=("-p${MYSQL_ROOT_PASSWORD}")
 fi
 
+# 连接失败则提示输入密码
 if ! "${mysql_cli[@]}" --execute "SELECT 1" >/dev/null 2>&1; then
-  read -rsp "请输入 MySQL root 密码（若已免密可直接回车）: " root_pwd
+  read -rsp "请输入 MySQL root 密码[若已免密可直接回车]: " root_pwd
   echo
   if [[ -n "$root_pwd" ]]; then
     mysql_cli=(mysql --protocol=socket -uroot "-p${root_pwd}")
   fi
 fi
 
-# 配置函数
+# ---------------------- 配置辅助函数 ----------------------
+
+# set_bind_address: 设置 MySQL 绑定地址
+# - 127.0.0.1: 仅本地访问
+# - 0.0.0.0: 允许所有 IP 访问
+# - 指定 IP: 仅允许该 IP 访问
 set_bind_address() {
   local ip="$1"
   set_config_value bind-address "$ip"
 }
 
+# set_thread_concurrency: 设置线程并发数
+# 建议值: CPU 核数 * 2
 set_thread_concurrency() {
   local value="$1"
   set_config_value thread_concurrency "$value"
 }
 
+# set_storage_engine: 设置默认存储引擎
+# 可选: InnoDB(推荐), MyISAM, MEMORY
 set_storage_engine() {
   local engine="$1"
   set_config_value default_storage_engine "$engine"
 }
 
-validate_size_format() {
-  local size="$1"
-  [[ "$size" =~ ^[0-9]+[KkMmGg]?$ ]]
-}
+print_section "3/7 网络访问配置"
 
-# 远程访问
+# ---------------------- 绑定地址配置 ----------------------
+# 设置 MySQL 监听的网络接口
+# - 限制 IP: 只允许指定 IP 访问
+# - 不限制: 允许所有 IP 访问(0.0.0.0)
+
+# 远程访问 - 对于 apt 系统，需额外禁用 MySQL X Protocol
 if [[ "$PKG_MGR" == "apt" ]]; then
   set_config_value mysqlx-bind-address 127.0.0.1 || true
 fi
 
-echo "远程访问配置："
+print_subsection "绑定地址设置"
 read -rp "是否限制为指定 IP 访问? (y/N): " limit_remote
 if [[ "${limit_remote:-}" =~ ^[Yy]$ ]]; then
   read -rp "请输入允许访问的 IP 地址: " allowed_ip
   if [[ -z "${allowed_ip:-}" ]]; then
-    echo "未提供 IP，已退出。" >&2
+    print_error "未提供 IP，已退出。"
     exit 1
   fi
   set_bind_address "$allowed_ip"
-  echo "MySQL 监听地址已设为: $allowed_ip"
+  print_success "MySQL 监听地址已设为: $allowed_ip"
 else
   set_bind_address "0.0.0.0"
-  echo "MySQL 监听地址已设为: 0.0.0.0（不限制 IP）"
+  print_success "MySQL 监听地址已设为: 0.0.0.0 (不限制 IP)"
 fi
 
+print_section "4/7 性能参数配置"
+
+# ---------------------- 线程并发配置 ----------------------
+# thread_concurrency: 并发线程数
+# 建议值: CPU 核数 * 2
 CPU_CORES=$(nproc)
 MAX_THREAD_CONCURRENCY=$((CPU_CORES * 2))
 
-echo "thread_concurrency 配置："
-echo "默认（推荐）：$MAX_THREAD_CONCURRENCY（CPU 核数的 2 倍）。自定义值必须小于 $MAX_THREAD_CONCURRENCY。"
-read -rp "请输入 thread_concurrency（< $MAX_THREAD_CONCURRENCY），回车使用默认: " tc_input
+print_subsection "线程并发配置"
+print_info "CPU 核数: $CPU_CORES"
+echo "默认[推荐]：$MAX_THREAD_CONCURRENCY[CPU 核数的 2 倍]。自定义值必须小于 $MAX_THREAD_CONCURRENCY。"
+read -rp "请输入 thread_concurrency[< $MAX_THREAD_CONCURRENCY]，回车使用默认: " tc_input
 
 if [[ -n "${tc_input:-}" ]]; then
   if ! [[ "$tc_input" =~ ^[0-9]+$ ]]; then
-    echo "thread_concurrency 必须是数字。" >&2
+    print_error "thread_concurrency 必须是数字。"
     exit 1
   fi
   if (( tc_input <= 0 || tc_input >= MAX_THREAD_CONCURRENCY )); then
-    echo "thread_concurrency 需大于 0 且小于 $MAX_THREAD_CONCURRENCY。" >&2
+    print_error "thread_concurrency 需大于 0 且小于 $MAX_THREAD_CONCURRENCY。"
     exit 1
   fi
   thread_concurrency="$tc_input"
@@ -168,26 +312,40 @@ else
 fi
 
 set_thread_concurrency "$thread_concurrency"
-echo "thread_concurrency 已设置为: $thread_concurrency"
+print_success "thread_concurrency 已设置为: $thread_concurrency"
+
+# ---------------------- 最大连接数配置 ----------------------
+# max_connections: 同时允许的最大客户端连接数
+# 注意: 过大可能导致内存耗尽
+# 经验值:
+#   - Max_used_connections/max_connections < 10% : 可能设置过大
+#   - Max_used_connections/max_connections > 85% : 需要提升
+print_subsection "最大连接数配置"
 
 default_max_connections="200"
 open_files_limit_info=$("${mysql_cli[@]}" --silent --skip-column-names --execute "SHOW VARIABLES LIKE 'open_files_limit';" 2>/dev/null | awk 'NR==1{print $2}')
-echo "最大连接数配置（过大可能导致内存耗尽；经验：Max_used_connections/max_connections <10% 可能过大，>85% 需考虑提升）。"
+echo "最大连接数配置[过大可能导致内存耗尽；经验：Max_used_connections/max_connections <10% 可能过大，>85% 需考虑提升]。"
 if [[ -n "${open_files_limit_info:-}" ]]; then
-  echo "当前 MySQL open_files_limit: $open_files_limit_info（需 >= max_connections）。"
+  echo "当前 MySQL open_files_limit: $open_files_limit_info[需 >= max_connections]。"
 fi
-read -rp "请输入 max_connections（默认: $default_max_connections）: " max_conn_input
+read -rp "请输入 max_connections[默认: $default_max_connections]: " max_conn_input
 max_connections="${max_conn_input:-$default_max_connections}"
 if ! [[ "$max_connections" =~ ^[0-9]+$ ]] || (( max_connections <= 0 )); then
-  echo "max_connections 必须为正整数。" >&2
+  print_error "max_connections 必须为正整数。"
   exit 1
 fi
 set_config_value max_connections "$max_connections"
-echo "max_connections 已设置为: $max_connections"
+print_success "max_connections 已设置为: $max_connections"
 
+print_section "5/7 存储引擎配置"
+
+# ---------------------- 存储引擎选择 ----------------------
+# InnoDB:  支持事务、行级锁、崩溃恢复(推荐)
+# MyISAM:  表级锁、无事务、读性能好
+# MEMORY:  数据存内存、极快但重启丢失
 cat <<'EOF'
 存储引擎选项：
-- InnoDB : 支持事务/行级锁/崩溃恢复（推荐）。
+- InnoDB : 支持事务/行级锁/崩溃恢复[推荐]。
 - MyISAM : 表级锁，无事务，读性能好。
 - MEMORY : 数据存内存，极快但不持久。
 存储引擎对比：
@@ -202,18 +360,25 @@ cat <<'EOF'
 EOF
 
 default_engine="InnoDB"
-read -rp "请选择存储引擎 [InnoDB/MyISAM/MEMORY]（默认: ${default_engine}）: " engine_input
+read -rp "请选择存储引擎 [InnoDB/MyISAM/MEMORY][默认: ${default_engine}]: " engine_input
 engine_choice=${engine_input:-$default_engine}
 engine_choice=${engine_choice^^}
 
 case "$engine_choice" in
   INNODB)
     set_storage_engine "$engine_choice"
-    echo "已选择 InnoDB 引擎，default_storage_engine 已设置。"
+    print_success "已选择 InnoDB 引擎"
+
+    # -------------------- InnoDB 参数调优 --------------------
+    # innodb_buffer_pool_size: InnoDB 缓冲池大小，建议物理内存的60%-80%
+    # innodb_log_file_size: 日志文件大小，影响崩溃恢复时间
+    # innodb_flush_log_at_trx_commit: 事务提交时日志刷新策略
+    #   1=每次提交刷新(最安全) 2=每秒刷新 0=由OS决定(最快)
+    print_subsection "InnoDB 参数调优"
 
     mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo || true)
     if [[ -n "${mem_kb:-}" && "$mem_kb" =~ ^[0-9]+$ ]]; then
-      default_buffer_pool="$((mem_kb * 75 / 100 / 1024))M" # ~75% RAM
+      default_buffer_pool="$((mem_kb * 75 / 100 / 1024))M"
     else
       default_buffer_pool="1G"
     fi
@@ -234,114 +399,121 @@ case "$engine_choice" in
     default_sort_buffer_size="256M"
     default_table_locks="ON"
 
-    echo "InnoDB 参数调优（回车使用默认）："
+    print_info "回车使用默认值"
+    echo
 
-    read -rp "innodb_buffer_pool_size（建议物理内存的 60%-80%，默认: $default_buffer_pool）: " bp_input
+    # 缓冲池大小 - 核心性能参数
+    read -rp "innodb_buffer_pool_size[建议物理内存的 60%-80%，默认: $default_buffer_pool]: " bp_input
     innodb_buffer_pool_size="${bp_input:-$default_buffer_pool}"
     if ! validate_size_format "$innodb_buffer_pool_size"; then
-      echo "innodb_buffer_pool_size 格式无效，请用数字加可选 K/M/G 后缀。" >&2
+      print_error "innodb_buffer_pool_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
-    read -rp "innodb_log_file_size（典型 256M-1G，默认: $default_log_file_size）: " log_input
+    # 日志文件大小
+    read -rp "innodb_log_file_size[典型 256M-1G，默认: $default_log_file_size]: " log_input
     innodb_log_file_size="${log_input:-$default_log_file_size}"
     if ! validate_size_format "$innodb_log_file_size"; then
-      echo "innodb_log_file_size 格式无效，请用数字加可选 K/M/G 后缀。" >&2
+      print_error "innodb_log_file_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
-    read -rp "innodb_flush_log_at_trx_commit [0/1/2]（默认: $default_flush_at_trx_commit）: " flush_trx_input
+    # 事务提交时日志刷新策略: 1=最安全 2=每秒 0=OS决定
+    read -rp "innodb_flush_log_at_trx_commit [0/1/2][默认: $default_flush_at_trx_commit]: " flush_trx_input
     flush_trx="${flush_trx_input:-$default_flush_at_trx_commit}"
     if ! [[ "$flush_trx" =~ ^[0-2]$ ]]; then
-      echo "innodb_flush_log_at_trx_commit 只能为 0/1/2。" >&2
+      print_error "innodb_flush_log_at_trx_commit 只能为 0/1/2。"
       exit 1
     fi
 
-    read -rp "innodb_file_per_table [0/1]（默认: $default_file_per_table）: " fpt_input
+    # 每表独立表空间: 1=启用(推荐) 0=共享表空间
+    read -rp "innodb_file_per_table [0/1][默认: $default_file_per_table]: " fpt_input
     file_per_table="${fpt_input:-$default_file_per_table}"
     if ! [[ "$file_per_table" =~ ^[01]$ ]]; then
-      echo "innodb_file_per_table 只能为 0 或 1。" >&2
+      print_error "innodb_file_per_table 只能为 0 或 1。"
       exit 1
     fi
 
-    read -rp "innodb_flush_method [O_DIRECT/fsync/O_DSYNC]（默认: $default_flush_method）: " fm_input
+    # 数据刷新方式: O_DIRECT=绕过OS缓存 fsync=标准 O_DSYNC=同步IO
+    read -rp "innodb_flush_method [O_DIRECT/fsync/O_DSYNC][默认: $default_flush_method]: " fm_input
     flush_method="${fm_input:-$default_flush_method}"
     flush_method_upper=${flush_method^^}
     case "$flush_method_upper" in
       O_DIRECT|FSYNC|O_DSYNC) ;;
       *)
-        echo "innodb_flush_method 只能为 O_DIRECT、fsync、O_DSYNC。" >&2
+        print_error "innodb_flush_method 只能为 O_DIRECT、fsync、O_DSYNC。"
         exit 1
         ;;
     esac
 
-    read -rp "innodb_read_io_threads（默认: $default_io_threads）: " read_io_input
+    # IO 线程数 - 影响并发 IO 性能
+    read -rp "innodb_read_io_threads[默认: $default_io_threads]: " read_io_input
     innodb_read_io_threads="${read_io_input:-$default_io_threads}"
     if ! [[ "$innodb_read_io_threads" =~ ^[0-9]+$ ]] || (( innodb_read_io_threads <= 0 )); then
-      echo "innodb_read_io_threads 必须为正整数。" >&2
+      print_error "innodb_read_io_threads 必须为正整数。"
       exit 1
     fi
 
-    read -rp "innodb_write_io_threads（默认: $default_io_threads）: " write_io_input
+    read -rp "innodb_write_io_threads[默认: $default_io_threads]: " write_io_input
     innodb_write_io_threads="${write_io_input:-$default_io_threads}"
     if ! [[ "$innodb_write_io_threads" =~ ^[0-9]+$ ]] || (( innodb_write_io_threads <= 0 )); then
-      echo "innodb_write_io_threads 必须为正整数。" >&2
+      print_error "innodb_write_io_threads 必须为正整数。"
       exit 1
     fi
 
-    read -rp "innodb_io_capacity（默认: $default_io_capacity）: " io_cap_input
+    read -rp "innodb_io_capacity[默认: $default_io_capacity]: " io_cap_input
     innodb_io_capacity="${io_cap_input:-$default_io_capacity}"
     if ! [[ "$innodb_io_capacity" =~ ^[0-9]+$ ]] || (( innodb_io_capacity <= 0 )); then
-      echo "innodb_io_capacity 必须为正整数。" >&2
+      print_error "innodb_io_capacity 必须为正整数。"
       exit 1
     fi
 
-    read -rp "innodb_io_capacity_max（默认: $default_io_capacity_max）: " io_cap_max_input
+    read -rp "innodb_io_capacity_max[默认: $default_io_capacity_max]: " io_cap_max_input
     innodb_io_capacity_max="${io_cap_max_input:-$default_io_capacity_max}"
     if ! [[ "$innodb_io_capacity_max" =~ ^[0-9]+$ ]] || (( innodb_io_capacity_max <= 0 )); then
-      echo "innodb_io_capacity_max 必须为正整数。" >&2
+      print_error "innodb_io_capacity_max 必须为正整数。"
       exit 1
     fi
     if (( innodb_io_capacity_max < innodb_io_capacity )); then
-      echo "innodb_io_capacity_max 必须大于等于 innodb_io_capacity。" >&2
+      print_error "innodb_io_capacity_max 必须大于等于 innodb_io_capacity。"
       exit 1
     fi
 
-    read -rp "innodb_flush_log_at_timeout（默认: $default_flush_log_timeout）: " flush_timeout_input
+    read -rp "innodb_flush_log_at_timeout[默认: $default_flush_log_timeout]: " flush_timeout_input
     innodb_flush_log_at_timeout="${flush_timeout_input:-$default_flush_log_timeout}"
     if ! [[ "$innodb_flush_log_at_timeout" =~ ^[0-9]+$ ]] || (( innodb_flush_log_at_timeout <= 0 )); then
-      echo "innodb_flush_log_at_timeout 必须为正整数。" >&2
+      print_error "innodb_flush_log_at_timeout 必须为正整数。"
       exit 1
     fi
 
-    read -rp "innodb_lock_wait_timeout（默认: $default_lock_wait_timeout）: " lock_timeout_input
+    read -rp "innodb_lock_wait_timeout[默认: $default_lock_wait_timeout]: " lock_timeout_input
     innodb_lock_wait_timeout="${lock_timeout_input:-$default_lock_wait_timeout}"
     if ! [[ "$innodb_lock_wait_timeout" =~ ^[0-9]+$ ]] || (( innodb_lock_wait_timeout <= 0 )); then
-      echo "innodb_lock_wait_timeout 必须为正整数。" >&2
+      print_error "innodb_lock_wait_timeout 必须为正整数。"
       exit 1
     fi
 
-    read -rp "innodb_adaptive_hash_index [0/1]（默认: $default_adaptive_hash）: " ahi_input
+    read -rp "innodb_adaptive_hash_index [0/1][默认: $default_adaptive_hash]: " ahi_input
     innodb_adaptive_hash_index="${ahi_input:-$default_adaptive_hash}"
     if ! [[ "$innodb_adaptive_hash_index" =~ ^[01]$ ]]; then
-      echo "innodb_adaptive_hash_index 只能为 0 或 1。" >&2
+      print_error "innodb_adaptive_hash_index 只能为 0 或 1。"
       exit 1
     fi
 
-    read -rp "innodb_sort_buffer_size（默认: $default_sort_buffer_size）: " sort_buffer_input
+    read -rp "innodb_sort_buffer_size[默认: $default_sort_buffer_size]: " sort_buffer_input
     innodb_sort_buffer_size="${sort_buffer_input:-$default_sort_buffer_size}"
     if ! validate_size_format "$innodb_sort_buffer_size"; then
-      echo "innodb_sort_buffer_size 格式无效，请用数字加可选 K/M/G 后缀。" >&2
+      print_error "innodb_sort_buffer_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
-    read -rp "innodb_table_locks [ON/OFF]（默认: $default_table_locks）: " table_locks_input
+    read -rp "innodb_table_locks [ON/OFF][默认: $default_table_locks]: " table_locks_input
     innodb_table_locks="${table_locks_input:-$default_table_locks}"
     innodb_table_locks_upper=${innodb_table_locks^^}
     case "$innodb_table_locks_upper" in
       ON|OFF|1|0) ;;
       *)
-        echo "innodb_table_locks 只能为 ON/OFF/1/0。" >&2
+        print_error "innodb_table_locks 只能为 ON/OFF/1/0。"
         exit 1
         ;;
     esac
@@ -360,11 +532,17 @@ case "$engine_choice" in
     set_config_value innodb_adaptive_hash_index "$innodb_adaptive_hash_index"
     set_config_value innodb_sort_buffer_size "$innodb_sort_buffer_size"
     set_config_value innodb_table_locks "$innodb_table_locks_upper"
-    echo "InnoDB 参数已配置。"
+    print_success "InnoDB 参数配置完成"
     ;;
   MYISAM)
     set_storage_engine "$engine_choice"
-    echo "已选择 MyISAM 引擎，default_storage_engine 已设置。"
+    print_success "已选择 MyISAM 引擎"
+
+    # -------------------- MyISAM 参数调优 --------------------
+    # key_buffer_size: 索引缓冲区大小，建议占可用内存的25%
+    # read_buffer_size: 顺序读取缓冲区
+    # read_rnd_buffer_size: 随机读取缓冲区
+    print_subsection "MyISAM 参数调优"
 
     mem_kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo || true)
     if [[ -n "${mem_kb:-}" && "$mem_kb" =~ ^[0-9]+$ ]]; then
@@ -375,118 +553,153 @@ case "$engine_choice" in
     default_read_buffer="128K"
     default_read_rnd_buffer="256K"
 
-    read -rp "key_buffer_size（默认: $default_key_buffer）：建议约可用内存的 1/4: " key_buffer_input
+    read -rp "key_buffer_size[默认: $default_key_buffer]：建议约可用内存的 1/4: " key_buffer_input
     key_buffer_size="${key_buffer_input:-$default_key_buffer}"
     if ! validate_size_format "$key_buffer_size"; then
-      echo "key_buffer_size 格式无效，请用数字加可选 K/M/G 后缀。" >&2
+      print_error "key_buffer_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
-    read -rp "read_buffer_size（默认: $default_read_buffer）: " read_buffer_input
+    read -rp "read_buffer_size[默认: $default_read_buffer]: " read_buffer_input
     read_buffer_size="${read_buffer_input:-$default_read_buffer}"
     if ! validate_size_format "$read_buffer_size"; then
-      echo "read_buffer_size 格式无效，请用数字加可选 K/M/G 后缀。" >&2
+      print_error "read_buffer_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
-    read -rp "read_rnd_buffer_size（默认: $default_read_rnd_buffer）: " read_rnd_buffer_input
+    read -rp "read_rnd_buffer_size[默认: $default_read_rnd_buffer]: " read_rnd_buffer_input
     read_rnd_buffer_size="${read_rnd_buffer_input:-$default_read_rnd_buffer}"
     if ! validate_size_format "$read_rnd_buffer_size"; then
-      echo "read_rnd_buffer_size 格式无效，请用数字加可选 K/M/G 后缀。" >&2
+      print_error "read_rnd_buffer_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
     set_config_value key_buffer_size "$key_buffer_size"
     set_config_value read_buffer_size "$read_buffer_size"
     set_config_value read_rnd_buffer_size "$read_rnd_buffer_size"
-    echo "MyISAM 缓冲区已配置: key_buffer_size=$key_buffer_size, read_buffer_size=$read_buffer_size, read_rnd_buffer_size=$read_rnd_buffer_size"
+    print_success "MyISAM 参数配置完成"
     ;;
   MEMORY)
     set_storage_engine "$engine_choice"
-    echo "已选择 MEMORY 引擎，default_storage_engine 已设置。"
+    print_success "已选择 MEMORY 引擎"
+
+    # -------------------- MEMORY 参数调优 --------------------
+    # max_heap_table_size: 单个 MEMORY 表最大大小
+    # tmp_table_size: 内部临时表最大大小
+    # 注意: 建议两者保持一致，避免临时表落盘
+    print_subsection "MEMORY 参数调优"
 
     default_max_heap="64M"
     default_tmp_table="64M"
 
-    echo "MEMORY 引擎参数（建议 max_heap_table_size 与 tmp_table_size 保持一致，避免临时表落盘）："
+    print_info "建议 max_heap_table_size 与 tmp_table_size 保持一致，避免临时表落盘"
+    echo
 
-    read -rp "max_heap_table_size（每张 MEMORY 表上限，默认: $default_max_heap）: " max_heap_input
+    read -rp "max_heap_table_size[每张 MEMORY 表上限，默认: $default_max_heap]: " max_heap_input
     max_heap_table_size="${max_heap_input:-$default_max_heap}"
     if ! validate_size_format "$max_heap_table_size"; then
-      echo "max_heap_table_size 格式无效，请用数字加可选 K/M/G 后缀。" >&2
+      print_error "max_heap_table_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
-    read -rp "tmp_table_size（内部内存临时表上限，默认: $default_tmp_table）: " tmp_table_input
+    read -rp "tmp_table_size[内部内存临时表上限，默认: $default_tmp_table]: " tmp_table_input
     tmp_table_size="${tmp_table_input:-$default_tmp_table}"
     if ! validate_size_format "$tmp_table_size"; then
-      echo "tmp_table_size 格式无效，请用数字加可选 K/M/G 后缀。" >&2
+      print_error "tmp_table_size 格式无效，请用数字加可选 K/M/G 后缀。"
       exit 1
     fi
 
     set_config_value max_heap_table_size "$max_heap_table_size"
     set_config_value tmp_table_size "$tmp_table_size"
-    echo "MEMORY 参数已配置: max_heap_table_size=$max_heap_table_size, tmp_table_size=$tmp_table_size"
+    print_success "MEMORY 参数配置完成"
     ;;
   *)
-    echo "存储引擎选择无效。可选: InnoDB, MyISAM, MEMORY。" >&2
+    print_error "存储引擎选择无效。可选: InnoDB, MyISAM, MEMORY。"
     exit 1
     ;;
-  esac
+esac
 
-# root 远程登录与额外用户
+print_section "6/7 用户权限配置"
 
-echo "root 远程登录配置："
-read -rp "是否允许 root 远程登录（host=%）? (y/N): " allow_root_remote
+# ---------------------- Root 用户访问配置 ----------------------
+# 远程登录: 创建 root@'%' 并同步更新 root@'localhost' 密码
+# 仅本地: 删除 root@'%'，保留 root@'localhost'
+print_subsection "Root 用户访问配置"
+read -rp "是否允许 root 远程登录[host=%]? (y/N): " allow_root_remote
 if [[ "${allow_root_remote:-}" =~ ^[Yy]$ ]]; then
   root_remote_pwd="${MYSQL_ROOT_PASSWORD:-}"
   if [[ -z "$root_remote_pwd" ]]; then
-    read -rsp "请输入 root 密码（远程登录必填）: " root_remote_pwd
+    read -rsp "请输入 root 密码[远程登录必填]: " root_remote_pwd
     echo
     if [[ -z "$root_remote_pwd" ]]; then
-      echo "未提供 root 密码，无法配置远程登录。" >&2
+      print_error "未提供 root 密码，无法配置远程登录。"
       exit 1
     fi
   fi
-  root_remote_pwd_escaped=${root_remote_pwd//\'/'"'"'}
-  "${mysql_cli[@]}" --execute="CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED WITH mysql_native_password BY '$root_remote_pwd_escaped'; GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
-  echo "已允许 root 远程登录（host=%）。"
+  root_remote_pwd_escaped=${root_remote_pwd//\'/\'\'}
+  "${mysql_cli[@]}" --execute="CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '$root_remote_pwd_escaped'; GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+  "${mysql_cli[@]}" --execute="ALTER USER 'root'@'localhost' IDENTIFIED BY '$root_remote_pwd_escaped'; FLUSH PRIVILEGES;"
+  print_success "已允许 root 远程登录 [host=%]"
+  print_info "root@localhost 密码已同步更新为远程登录密码"
 else
   root_local_pwd="${MYSQL_ROOT_PASSWORD:-}"
   if [[ -z "$root_local_pwd" ]]; then
-    read -rsp "是否为 root 设置/更新密码（回车跳过保留当前）: " root_local_pwd
+    read -rsp "是否为 root 设置/更新密码[回车跳过保留当前]: " root_local_pwd
     echo
   fi
   root_local_clause=""
   if [[ -n "$root_local_pwd" ]]; then
-    root_local_pwd_escaped=${root_local_pwd//\'/'"'"'}
-    root_local_clause=" IDENTIFIED WITH mysql_native_password BY '$root_local_pwd_escaped'"
+    root_local_pwd_escaped=${root_local_pwd//\'/\'\'}
+    root_local_clause=" IDENTIFIED BY '$root_local_pwd_escaped'"
   fi
-  "${mysql_cli[@]}" --execute="DROP USER IF EXISTS 'root'@'%'; CREATE USER IF NOT EXISTS 'root'@'localhost'${root_local_clause}; GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' WITH GRANT OPTION; FLUSH PRIVILEGES;"
-  echo "已限制 root 仅本地登录（host=localhost）。"
+  "${mysql_cli[@]}" --execute="DROP USER IF EXISTS 'root'@'%'; CREATE USER IF NOT EXISTS 'root'@'localhost'${root_local_clause}; GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost'; FLUSH PRIVILEGES;"
+  print_success "已限制 root 仅本地登录 [host=localhost]"
 fi
 
+# ---------------------- 额外用户创建 ----------------------
+# 可选: 创建具有全部权限的额外用户
+print_subsection "额外用户配置"
 read -rp "是否创建额外用户? (y/N): " create_extra_user
 if [[ "${create_extra_user:-}" =~ ^[Yy]$ ]]; then
   read -rp "请输入新用户名: " new_user
   if [[ -z "${new_user:-}" ]]; then
-    echo "未提供用户名，已退出。" >&2
+    print_error "未提供用户名，已退出。"
     exit 1
   fi
   read -rsp "请输入新用户密码: " new_user_pwd
   echo
   if [[ -z "${new_user_pwd:-}" ]]; then
-    echo "未提供密码，已退出。" >&2
+    print_error "未提供密码，已退出。"
     exit 1
   fi
-  read -rp "新用户可访问的主机（默认 %）: " new_user_host
+  read -rp "新用户可访问的主机[默认 %]: " new_user_host
   new_user_host=${new_user_host:-%}
-  new_user_pwd_escaped=${new_user_pwd//\'/'"'"'}
-  "${mysql_cli[@]}" --execute="CREATE USER IF NOT EXISTS '$new_user'@'$new_user_host' IDENTIFIED WITH mysql_native_password BY '$new_user_pwd_escaped'; GRANT ALL PRIVILEGES ON *.* TO '$new_user'@'$new_user_host'; FLUSH PRIVILEGES;"
-  echo "已创建用户 $new_user@$new_user_host 并授予权限。"
+  new_user_pwd_escaped=${new_user_pwd//\'/\'\'}
+  "${mysql_cli[@]}" --execute="CREATE USER IF NOT EXISTS '$new_user'@'$new_user_host' IDENTIFIED BY '$new_user_pwd_escaped'; GRANT ALL PRIVILEGES ON *.* TO '$new_user'@'$new_user_host'; FLUSH PRIVILEGES;"
+  print_success "已创建用户 $new_user@$new_user_host 并授予权限"
 fi
 
+print_section "7/7 完成与验证"
+
+# ---------------------- 重启服务并验证 ----------------------
+# 应用所有配置更改并显示最终状态
+print_info "正在重启服务..."
 systemctl restart "$MYSQL_SERVICE"
 
-mysql --version
-systemctl is-active --quiet "$MYSQL_SERVICE" && echo "MySQL 已运行。" || echo "MySQL 未运行。"
+echo
+echo -e "${CYAN}┌─────────────────────────────────────────────────────────────┐${NC}"
+echo -e "${CYAN}│                     安装配置完成                             │${NC}"
+echo -e "${CYAN}├─────────────────────────────────────────────────────────────┤${NC}"
+printf "${CYAN}│${NC}  %-20s: %-37s ${CYAN}│${NC}\n" "服务名" "$MYSQL_SERVICE"
+printf "${CYAN}│${NC}  %-20s: %-37s ${CYAN}│${NC}\n" "配置文件" "$CONFIG_FILE"
+printf "${CYAN}│${NC}  %-20s: %-37s ${CYAN}│${NC}\n" "存储引擎" "$engine_choice"
+printf "${CYAN}│${NC}  %-20s: %-37s ${CYAN}│${NC}\n" "最大连接数" "$max_connections"
+printf "${CYAN}│${NC}  %-20s: %-37s ${CYAN}│${NC}\n" "版本" "$(mysql --version 2>/dev/null | head -1)"
+echo -e "${CYAN}├─────────────────────────────────────────────────────────────┤${NC}"
+if systemctl is-active --quiet "$MYSQL_SERVICE"; then
+  echo -e "${CYAN}│${NC}  ${GREEN}✓ 服务状态: 运行中${NC}                                      ${CYAN}│${NC}"
+else
+  echo -e "${CYAN}│${NC}  ${RED}✗ 服务状态: 未运行${NC}                                      ${CYAN}│${NC}"
+fi
+echo -e "${CYAN}└─────────────────────────────────────────────────────────────┘${NC}"
+echo
