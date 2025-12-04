@@ -88,6 +88,17 @@ JAVA_FEATURE="${JAVA_FEATURE:-17}"
 INSTALL_ROOT="/opt/java"
 TMP_DIR="/tmp/java_install"
 
+# Maven 相关全局变量
+INSTALL_MAVEN="${INSTALL_MAVEN:-}"   # y / n，非交互模式可用
+MAVEN_INSTALL_ROOT="/opt/maven"
+MAVEN_TMP_DIR="/tmp/maven_install"
+
+# Web 服务器相关全局变量
+INSTALL_WEB_SERVER="${INSTALL_WEB_SERVER:-}"      # y / n，非交互模式可用
+WEB_SERVER_CHOICE="${WEB_SERVER_CHOICE:-}"        # tomcat | jetty | undertow
+WEB_SERVER_INSTALL_PATH="${WEB_SERVER_INSTALL_PATH:-/opt/webserver}"
+WEB_TMP_DIR="/tmp/webserver_install"
+
 # ---------------------- 架构与系统检测 ----------------------
 
 detect_arch() {
@@ -429,6 +440,465 @@ EOF
   print_info "对新登录的 Shell 生效，当前会话可手动执行: source $profile_file"
 }
 
+# ---------------------- Maven 安装相关 ----------------------
+
+prompt_install_maven() {
+  local choice
+
+  if [[ -n "$INSTALL_MAVEN" ]]; then
+    case "${INSTALL_MAVEN,,}" in
+      y|yes)
+        print_info "使用环境变量 INSTALL_MAVEN=yes，将安装 Maven。"
+        INSTALL_MAVEN="y"
+        return 0
+        ;;
+      n|no)
+        print_info "使用环境变量 INSTALL_MAVEN=no，将跳过 Maven 安装。"
+        INSTALL_MAVEN="n"
+        return 0
+        ;;
+      *)
+        print_warning "无效的 INSTALL_MAVEN=${INSTALL_MAVEN}，将进入交互式选择。"
+        ;;
+    esac
+  fi
+
+  echo
+  echo "是否安装 Apache Maven（构建 Java 项目常用工具）?"
+  echo "  1) 是，安装最新稳定版 Maven"
+  echo "  2) 否，跳过 Maven 安装"
+  echo
+
+  while true; do
+    read -rp "请输入选项 [1/2] (默认 2 跳过): " choice
+    case "${choice,,}" in
+      1)
+        INSTALL_MAVEN="y"
+        break
+        ;;
+      2|"")
+        INSTALL_MAVEN="n"
+        break
+        ;;
+      *)
+        print_warning "无效输入，请输入 1 或 2。"
+        ;;
+    esac
+  done
+}
+
+detect_latest_maven_version() {
+  local base_url="https://dlcdn.apache.org/maven/maven-3/"
+
+  print_info "从 Apache 镜像获取 Maven 最新版本信息..."
+
+  # 从目录列表中提取 3.x.y 形式的版本号，使用 sort -V 选择最大版本
+  local latest
+  latest="$(wget -qO- "$base_url" \
+    | grep -Eo 'href=\"3\.[0-9]+\.[0-9]+/' \
+    | sed -E 's/href=\"(3\.[0-9]+\.[0-9]+)\/\"/\1/' \
+    | sort -V \
+    | tail -n 1 || true)"
+
+  if [[ -z "$latest" ]]; then
+    print_error "未能获取 Maven 最新版本号，请稍后重试。"
+    exit 1
+  fi
+
+  echo "$latest"
+}
+
+download_maven() {
+  local version="$1"
+
+  mkdir -p "$MAVEN_TMP_DIR"
+
+  local base_url="https://dlcdn.apache.org/maven/maven-3"
+  local url="${base_url}/${version}/binaries/apache-maven-${version}-bin.tar.gz"
+  local tarball="${MAVEN_TMP_DIR}/apache-maven-${version}-bin.tar.gz"
+
+  print_subsection "下载 Maven"
+  print_info "Maven 版本: $version"
+  print_info "下载地址  : $url"
+  print_info "保存到    : $tarball"
+  echo
+
+  local wget_log="${MAVEN_TMP_DIR}/wget_maven.log"
+  if ! wget -S --progress=bar:force -O "$tarball" "$url" 2>"$wget_log"; then
+    print_error "Maven 下载失败，请检查网络连接或镜像站点。"
+    if [[ -s "$wget_log" ]]; then
+      echo
+      print_info "wget 失败详细信息如下（便于排查原因）:"
+      sed 's/^/  /' "$wget_log" >&2 || true
+    fi
+    exit 1
+  fi
+
+  print_success "Maven 下载完成"
+  echo "$tarball"
+}
+
+extract_maven() {
+  local tarball="$1"
+
+  mkdir -p "$MAVEN_INSTALL_ROOT"
+
+  print_subsection "解压 Maven"
+  print_info "解压到: $MAVEN_INSTALL_ROOT"
+
+  tar -xzf "$tarball" -C "$MAVEN_INSTALL_ROOT"
+
+  local top_dir
+  top_dir="$(tar -tf "$tarball" | head -n 1 | cut -d/ -f1)"
+
+  if [[ -z "$top_dir" ]]; then
+    print_error "无法确定 Maven 解压后的目录名。"
+    exit 1
+  fi
+
+  local maven_home="${MAVEN_INSTALL_ROOT}/${top_dir}"
+
+  if [[ ! -d "$maven_home" ]]; then
+    print_error "未能找到有效的 Maven 安装目录: $maven_home"
+    exit 1
+  fi
+
+  print_success "Maven 解压完成，MAVEN_HOME: $maven_home"
+  echo "$maven_home"
+}
+
+write_profile_maven() {
+  local maven_home="$1"
+  local profile_file="/etc/profile.d/maven.sh"
+
+  print_subsection "写入 Maven 环境变量到 $profile_file"
+
+  cat > "$profile_file" <<EOF
+#!/usr/bin/env bash
+#
+# 自动生成: Maven 环境变量
+
+export M2_HOME="$maven_home"
+export MAVEN_HOME="\$M2_HOME"
+export PATH="\$M2_HOME/bin:\$PATH"
+EOF
+
+  chmod 644 "$profile_file"
+
+  print_success "已写入 M2_HOME / MAVEN_HOME 和 PATH 设置到: $profile_file"
+  print_info "对新登录的 Shell 生效，当前会话可手动执行: source $profile_file"
+}
+
+# ---------------------- Web 服务器安装相关 ----------------------
+
+prompt_install_web_server() {
+  local choice input_path
+
+  if [[ -n "$INSTALL_WEB_SERVER" ]]; then
+    case "${INSTALL_WEB_SERVER,,}" in
+      y|yes)
+        print_info "使用环境变量 INSTALL_WEB_SERVER=yes，将安装 Web 服务器。"
+        INSTALL_WEB_SERVER="y"
+        ;;
+      n|no)
+        print_info "使用环境变量 INSTALL_WEB_SERVER=no，将跳过 Web 服务器安装。"
+        INSTALL_WEB_SERVER="n"
+        return 0
+        ;;
+      *)
+        print_warning "无效的 INSTALL_WEB_SERVER=${INSTALL_WEB_SERVER}，将进入交互式选择。"
+        ;;
+    esac
+  fi
+
+  if [[ -z "$INSTALL_WEB_SERVER" ]]; then
+    echo
+    echo "是否安装 Web 服务器?"
+    echo "  1) 是"
+    echo "  2) 否 (默认)"
+    echo
+
+    while true; do
+      read -rp "请输入选项 [1/2] (默认 2 跳过): " choice
+      case "${choice,,}" in
+        1)
+          INSTALL_WEB_SERVER="y"
+          break
+          ;;
+        2|"")
+          INSTALL_WEB_SERVER="n"
+          return 0
+          ;;
+        *)
+          print_warning "无效输入，请输入 1 或 2。"
+          ;;
+      esac
+    done
+  fi
+
+  # 选择具体 Web 服务器
+  if [[ -n "$WEB_SERVER_CHOICE" ]]; then
+    case "${WEB_SERVER_CHOICE,,}" in
+      tomcat|jetty|undertow)
+        WEB_SERVER_CHOICE="${WEB_SERVER_CHOICE,,}"
+        print_info "使用环境变量 WEB_SERVER_CHOICE: $WEB_SERVER_CHOICE"
+        ;;
+      *)
+        print_warning "无效的 WEB_SERVER_CHOICE=${WEB_SERVER_CHOICE}，将进入交互式选择。"
+        WEB_SERVER_CHOICE=""
+        ;;
+    esac
+  fi
+
+  if [[ -z "$WEB_SERVER_CHOICE" ]]; then
+    echo
+    echo "请选择要安装的 Web 服务器:"
+    echo "  1) Tomcat   (默认)"
+    echo "  2) Jetty"
+    echo "  3) Undertow"
+    echo
+
+    while true; do
+      read -rp "请输入选项 [1/2/3] (默认 1): " choice
+      case "${choice,,}" in
+        1|"")
+          WEB_SERVER_CHOICE="tomcat"
+          break
+          ;;
+        2)
+          WEB_SERVER_CHOICE="jetty"
+          break
+          ;;
+        3)
+          WEB_SERVER_CHOICE="undertow"
+          break
+          ;;
+        *)
+          print_warning "无效输入，请输入 1 / 2 / 3。"
+          ;;
+      esac
+    done
+  fi
+
+  # 输入安装路径
+  if [[ -n "$WEB_SERVER_INSTALL_PATH" ]]; then
+    print_info "使用 Web 服务器安装路径: $WEB_SERVER_INSTALL_PATH"
+  else
+    read -rp "请输入 Web 服务器安装路径 (默认 /opt/webserver): " input_path
+    WEB_SERVER_INSTALL_PATH="${input_path:-/opt/webserver}"
+  fi
+}
+
+download_web_server() {
+  local server="$1"
+
+  mkdir -p "$WEB_TMP_DIR"
+
+  local url tarball
+
+  case "$server" in
+    tomcat)
+      # 固定一个较新的稳定版本，后续如需更新可直接修改此处
+      tarball="apache-tomcat-10.1.31.tar.gz"
+      url="https://dlcdn.apache.org/tomcat/tomcat-10/v10.1.31/bin/${tarball}"
+      ;;
+    jetty)
+      # 使用 Jetty 11 的发行版 tar 包
+      tarball="jetty-distribution-11.0.24.tar.gz"
+      url="https://repo1.maven.org/maven2/org/eclipse/jetty/jetty-distribution/11.0.24/${tarball}"
+      ;;
+    undertow)
+      # Undertow 以可执行 JAR 形式提供，这里下载一个可直接 java -jar 运行的版本
+      tarball="undertow-servlet-2.2.17.Final.jar"
+      url="https://repo1.maven.org/maven2/io/undertow/undertow-servlet/2.2.17.Final/${tarball}"
+      ;;
+    *)
+      print_error "未知的 Web 服务器类型: $server"
+      exit 1
+      ;;
+  esac
+
+  local dest="${WEB_TMP_DIR}/${tarball}"
+
+  print_subsection "下载 Web 服务器 ($server)"
+  print_info "下载地址: $url"
+  print_info "保存到  : $dest"
+
+  local wget_log="${WEB_TMP_DIR}/wget_web_${server}.log"
+  if ! wget -S --progress=bar:force -O "$dest" "$url" 2>"$wget_log"; then
+    print_error "$server 下载失败，请检查网络连接或镜像站点。"
+    if [[ -s "$wget_log" ]]; then
+      echo
+      print_info "wget 失败详细信息如下（便于排查原因）:"
+      sed 's/^/  /' "$wget_log" >&2 || true
+    fi
+    exit 1
+  fi
+
+  print_success "$server 下载完成"
+  echo "$dest"
+}
+
+install_web_server() {
+  local server="$1"
+  local archive_path
+
+  archive_path="$(download_web_server "$server")"
+
+  mkdir -p "$WEB_SERVER_INSTALL_PATH"
+
+  local server_home=""
+
+  case "$server" in
+    tomcat|jetty)
+      print_subsection "解压 $server 到 $WEB_SERVER_INSTALL_PATH"
+      tar -xzf "$archive_path" -C "$WEB_SERVER_INSTALL_PATH"
+
+      local top_dir
+      top_dir="$(tar -tf "$archive_path" | head -n 1 | cut -d/ -f1)"
+
+      if [[ -z "$top_dir" ]]; then
+        print_error "无法确定 $server 解压后的目录名。"
+        exit 1
+      fi
+
+      server_home="${WEB_SERVER_INSTALL_PATH}/${top_dir}"
+
+      if [[ ! -d "$server_home" ]]; then
+        print_error "未能找到有效的 $server 安装目录: $server_home"
+        exit 1
+      fi
+      ;;
+    undertow)
+      print_subsection "安装 Undertow"
+      server_home="${WEB_SERVER_INSTALL_PATH}/undertow-servlet-2.2.17.Final"
+      mkdir -p "$server_home"
+      cp "$archive_path" "${server_home}/undertow-servlet-2.2.17.Final.jar"
+      ;;
+  esac
+
+  # 写入环境变量
+  case "$server" in
+    tomcat)
+      local profile_file="/etc/profile.d/tomcat.sh"
+      print_subsection "写入 Tomcat 环境变量到 $profile_file"
+      cat > "$profile_file" <<EOF
+#!/usr/bin/env bash
+#
+# 自动生成: Tomcat 环境变量
+
+export CATALINA_HOME="$server_home"
+export PATH="\$CATALINA_HOME/bin:\$PATH"
+EOF
+      chmod 644 "$profile_file"
+      ;;
+    jetty)
+      local profile_file="/etc/profile.d/jetty.sh"
+      print_subsection "写入 Jetty 环境变量到 $profile_file"
+      cat > "$profile_file" <<EOF
+#!/usr/bin/env bash
+#
+# 自动生成: Jetty 环境变量
+
+export JETTY_HOME="$server_home"
+export PATH="\$JETTY_HOME/bin:\$PATH"
+EOF
+      chmod 644 "$profile_file"
+      ;;
+    undertow)
+      local profile_file="/etc/profile.d/undertow.sh"
+      print_subsection "写入 Undertow 环境变量到 $profile_file"
+      cat > "$profile_file" <<EOF
+#!/usr/bin/env bash
+#
+# 自动生成: Undertow 环境变量
+
+export UNDERTOW_HOME="$server_home"
+EOF
+      chmod 644 "$profile_file"
+      ;;
+  esac
+
+  print_success "$server 环境变量配置完成"
+  echo "$server_home"
+}
+
+verify_web_server() {
+  local server="$1"
+  local server_home="$2"
+
+  print_subsection "验证 $server 安装和运行情况"
+
+  local status=0
+
+  case "$server" in
+    tomcat)
+      if [[ ! -x "$server_home/bin/startup.sh" ]]; then
+        print_error "未找到 Tomcat 启动脚本: $server_home/bin/startup.sh"
+        return 1
+      fi
+      if [[ ! -x "$server_home/bin/shutdown.sh" ]]; then
+        print_error "未找到 Tomcat 关闭脚本: $server_home/bin/shutdown.sh"
+        return 1
+      fi
+
+      if ! "$server_home/bin/startup.sh"; then
+        print_error "Tomcat 启动失败。"
+        return 1
+      fi
+
+      sleep 5
+
+      if ! "$server_home/bin/shutdown.sh"; then
+        print_error "Tomcat 关闭失败。"
+        return 1
+      fi
+      ;;
+    jetty)
+      if [[ ! -x "$server_home/bin/jetty.sh" ]]; then
+        print_error "未找到 Jetty 启动脚本: $server_home/bin/jetty.sh"
+        return 1
+      fi
+
+      if ! "$server_home/bin/jetty.sh" start; then
+        print_error "Jetty 启动失败。"
+        return 1
+      fi
+
+      sleep 5
+
+      if ! "$server_home/bin/jetty.sh" stop; then
+        print_error "Jetty 关闭失败。"
+        return 1
+      fi
+      ;;
+    undertow)
+      local jar_path="${server_home}/undertow-servlet-2.2.17.Final.jar"
+      if [[ ! -f "$jar_path" ]]; then
+        print_error "未找到 Undertow 可执行 JAR: $jar_path"
+        return 1
+      fi
+
+      # 在后台启动 Undertow，并在短暂等待后尝试关闭
+      java -jar "$jar_path" >/dev/null 2>&1 &
+      local pid=$!
+      sleep 5
+
+      if ! kill "$pid" >/dev/null 2>&1; then
+        print_error "无法正常关闭 Undertow (PID $pid)。"
+        return 1
+      fi
+      ;;
+    *)
+      print_error "未知的 Web 服务器类型: $server"
+      return 1
+      ;;
+  esac
+
+  print_success "$server 启动和关闭验证成功。"
+  return "$status"
+}
+
 # ---------------------- 主流程 ----------------------
 
 print_section "1/3 选择 Java 发行版与类型"
@@ -454,6 +924,43 @@ print_section "3/3 配置环境变量"
 
 write_profile_java "$JAVA_HOME_VALUE" "$JAVA_VENDOR"
 
+# 可选：安装 Maven
+MAVEN_HOME_VALUE=""
+prompt_install_maven
+
+if [[ "$INSTALL_MAVEN" == "y" ]]; then
+  print_section "附加操作: 安装 Maven"
+
+  local maven_version maven_tarball
+  maven_version="$(detect_latest_maven_version)"
+  maven_tarball="$(download_maven "$maven_version")"
+  MAVEN_HOME_VALUE="$(extract_maven "$maven_tarball")"
+  write_profile_maven "$MAVEN_HOME_VALUE"
+else
+  print_info "已选择跳过 Maven 安装。"
+fi
+
+# 可选：安装 Web 服务器
+WEB_SERVER_HOME_VALUE=""
+WEB_SERVER_SELECTED=""
+
+prompt_install_web_server
+
+if [[ "$INSTALL_WEB_SERVER" == "y" ]]; then
+  print_section "附加操作: 安装 Web 服务器 ($WEB_SERVER_CHOICE)"
+
+  WEB_SERVER_SELECTED="$WEB_SERVER_CHOICE"
+  WEB_SERVER_HOME_VALUE="$(install_web_server "$WEB_SERVER_SELECTED")"
+
+  if ! verify_web_server "$WEB_SERVER_SELECTED" "$WEB_SERVER_HOME_VALUE"; then
+    print_error "Web 服务器 $WEB_SERVER_SELECTED 安装或配置验证失败，请检查日志和配置。"
+  else
+    print_success "Web 服务器 $WEB_SERVER_SELECTED 安装和配置验证成功。"
+  fi
+else
+  print_info "已选择跳过 Web 服务器安装。"
+fi
+
 echo
 echo -e "${CYAN}┌─────────────────────────────────────────────────────────────┐${NC}"
 echo -e "${CYAN}│                     Java 安装完成                           │${NC}"
@@ -462,8 +969,35 @@ printf "${CYAN}│${NC}  %-20s: %-37s ${CYAN}│${NC}\n" "发行版" "$JAVA_VEND
 printf "${CYAN}│${NC}  %-20s: %-37s ${CYAN}│${NC}\n" "镜像类型" "$JAVA_TYPE"
 printf "${CYAN}│${NC}  %-20s: %-37s ${CYAN}│${NC}\n" "JAVA_HOME" "$JAVA_HOME_VALUE"
 printf "${CYAN}│${NC}  %-20s: %-37s ${CYAN}│${NC}\n" "java 路径" "$JAVA_HOME_VALUE/bin/java"
+if [[ -n "$MAVEN_HOME_VALUE" ]]; then
+  printf "${CYAN}│${NC}  %-20s: %-37s ${CYAN}│${NC}\n" "MAVEN_HOME" "$MAVEN_HOME_VALUE"
+  printf "${CYAN}│${NC}  %-20s: %-37s ${CYAN}│${NC}\n" "mvn 路径" "$MAVEN_HOME_VALUE/bin/mvn"
+fi
+if [[ -n "$WEB_SERVER_HOME_VALUE" ]]; then
+  printf "${CYAN}│${NC}  %-20s: %-37s ${CYAN}│${NC}\n" "Web 服务器" "$WEB_SERVER_SELECTED"
+  printf "${CYAN}│${NC}  %-20s: %-37s ${CYAN}│${NC}\n" "Web 目录" "$WEB_SERVER_HOME_VALUE"
+fi
 echo -e "${CYAN}├─────────────────────────────────────────────────────────────┤${NC}"
 echo -e "${CYAN}│${NC}  请重新登录终端，或执行: ${GREEN}source /etc/profile.d/java.sh${NC}      ${CYAN}│${NC}"
+if [[ -n "$MAVEN_HOME_VALUE" ]]; then
+echo -e "${CYAN}│${NC}  并执行: ${GREEN}source /etc/profile.d/maven.sh${NC}                          ${CYAN}│${NC}"
+fi
+if [[ -n "$WEB_SERVER_HOME_VALUE" ]]; then
+  case "$WEB_SERVER_SELECTED" in
+    tomcat)
+      echo -e "${CYAN}│${NC}  并执行: ${GREEN}source /etc/profile.d/tomcat.sh${NC}                         ${CYAN}│${NC}"
+      ;;
+    jetty)
+      echo -e "${CYAN}│${NC}  并执行: ${GREEN}source /etc/profile.d/jetty.sh${NC}                          ${CYAN}│${NC}"
+      ;;
+    undertow)
+      echo -e "${CYAN}│${NC}  并执行: ${GREEN}source /etc/profile.d/undertow.sh${NC}                       ${CYAN}│${NC}"
+      ;;
+  esac
+fi
 echo -e "${CYAN}│${NC}  验证 Java: ${GREEN}java -version${NC}                                  ${CYAN}│${NC}"
+if [[ -n "$MAVEN_HOME_VALUE" ]]; then
+echo -e "${CYAN}│${NC}  验证 Maven: ${GREEN}mvn -v${NC}                                       ${CYAN}│${NC}"
+fi
 echo -e "${CYAN}└─────────────────────────────────────────────────────────────┘${NC}"
 echo
