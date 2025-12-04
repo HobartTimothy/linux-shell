@@ -29,8 +29,10 @@
 # ============================================================
 
 #!/usr/bin/env bash
+
 # 严格模式: -e 错误退出 | -u 未定义变量报错 | -o pipefail 管道失败传递
 set -euo pipefail
+
 
 # ---------------------- 终端颜色定义 ----------------------
 # 用于美化输出，区分不同类型的信息
@@ -40,6 +42,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color - 重置颜色
+
 
 # ---------------------- 全局变量声明 ----------------------
 # 包管理器相关
@@ -75,6 +78,7 @@ readonly DEFAULT_IO_CAPACITY="200"
 readonly DEFAULT_IO_CAPACITY_MAX="2000"
 readonly DEFAULT_LOCK_WAIT_TIMEOUT="50"
 readonly DEFAULT_SORT_BUFFER_SIZE="256M"
+
 
 # ---------------------- 输出辅助函数 ----------------------
 
@@ -120,7 +124,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-print_section "1/7 环境检测与安装"
+print_section "---------------------- 1/7 环境检测与安装 ----------------------"
 
 # ---------------------- 包管理器检测 ----------------------
 
@@ -167,6 +171,7 @@ choose_config_file() {
       return
     fi
   done
+
   CONFIG_FILE="/etc/my.cnf"
   touch "$CONFIG_FILE"
   echo "[mysqld]" >> "$CONFIG_FILE"
@@ -214,7 +219,8 @@ install_mysql
 choose_config_file
 print_success "安装完成，配置文件: $CONFIG_FILE"
 
-print_section "2/7 服务检测与启动"
+
+print_section "---------------------- 2/7 服务检测与启动 ----------------------"
 
 # ---------------------- 服务名检测 ----------------------
 # 不同系统的服务名可能不同:
@@ -289,7 +295,8 @@ set_storage_engine() {
   set_config_value default_storage_engine "$engine"
 }
 
-print_section "3/7 网络访问配置"
+
+print_section "---------------------- 3/7 网络访问配置 ----------------------"
 
 # ---------------------- 绑定地址配置 ----------------------
 # 设置 MySQL 监听的网络接口
@@ -302,6 +309,7 @@ if [[ "$PKG_MGR" == "apt" ]]; then
 fi
 
 print_subsection "绑定地址设置"
+
 read -rp "是否限制为指定 IP 访问? (y/N): " limit_remote
 if [[ "${limit_remote:-}" =~ ^[Yy]$ ]]; then
   read -rp "请输入允许访问的 IP 地址: " allowed_ip
@@ -334,16 +342,19 @@ echo "最大连接数配置[过大可能导致内存耗尽；经验：Max_used_c
 if [[ -n "${open_files_limit_info:-}" ]]; then
   echo "当前 MySQL open_files_limit: $open_files_limit_info[需 >= max_connections]。"
 fi
+
 read -rp "请输入 max_connections[默认: $DEFAULT_MAX_CONNECTIONS]: " max_conn_input
 max_connections="${max_conn_input:-$DEFAULT_MAX_CONNECTIONS}"
 if ! [[ "$max_connections" =~ ^[0-9]+$ ]] || (( max_connections <= 0 )); then
   print_error "max_connections 必须为正整数。"
   exit 1
 fi
+
 set_config_value max_connections "$max_connections"
 print_success "max_connections 已设置为: $max_connections"
 
-print_section "5/7 存储引擎配置"
+
+print_section "---------------------- 5/7 存储引擎配置 ----------------------"
 
 # ---------------------- 存储引擎选择 ----------------------
 cat <<'EOF'
@@ -556,7 +567,7 @@ case "$engine_choice" in
     ;;
 esac
 
-print_section "6/7 用户权限配置"
+print_section "---------------------- 6/7 用户权限配置 ----------------------"
 
 # ---------------------- Root 用户访问配置 ----------------------
 # 远程登录: 创建 root@'%' 并同步更新 root@'localhost' 密码
@@ -573,9 +584,12 @@ if [[ "${allow_root_remote:-}" =~ ^[Yy]$ ]]; then
       exit 1
     fi
   fi
+
   root_remote_pwd_escaped=${root_remote_pwd//\'/\'\'}
+  
   "${mysql_cli[@]}" --execute="CREATE USER IF NOT EXISTS 'root'@'%' IDENTIFIED BY '$root_remote_pwd_escaped'; GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
   "${mysql_cli[@]}" --execute="ALTER USER 'root'@'localhost' IDENTIFIED BY '$root_remote_pwd_escaped'; FLUSH PRIVILEGES;"
+  
   print_success "已允许 root 远程登录 [host=%]"
   print_info "root@localhost 密码已同步更新为远程登录密码"
 else
@@ -584,11 +598,14 @@ else
     read -rsp "是否为 root 设置/更新密码[回车跳过保留当前]: " root_local_pwd
     echo
   fi
+  
   root_local_clause=""
+  
   if [[ -n "$root_local_pwd" ]]; then
     root_local_pwd_escaped=${root_local_pwd//\'/\'\'}
     root_local_clause=" IDENTIFIED BY '$root_local_pwd_escaped'"
   fi
+  
   "${mysql_cli[@]}" --execute="DROP USER IF EXISTS 'root'@'%'; CREATE USER IF NOT EXISTS 'root'@'localhost'${root_local_clause}; GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost'; FLUSH PRIVILEGES;"
   print_success "已限制 root 仅本地登录 [host=localhost]"
 fi
@@ -596,6 +613,7 @@ fi
 # ---------------------- 额外用户创建 ----------------------
 # 可选: 创建具有全部权限的额外用户
 print_subsection "额外用户配置"
+
 read -rp "是否创建额外用户? (y/N): " create_extra_user
 if [[ "${create_extra_user:-}" =~ ^[Yy]$ ]]; then
   read -rp "请输入新用户名: " new_user
@@ -603,12 +621,14 @@ if [[ "${create_extra_user:-}" =~ ^[Yy]$ ]]; then
     print_error "未提供用户名，已退出。"
     exit 1
   fi
+
   read -rsp "请输入新用户密码: " new_user_pwd
   echo
   if [[ -z "${new_user_pwd:-}" ]]; then
     print_error "未提供密码，已退出。"
     exit 1
   fi
+  
   read -rp "新用户可访问的主机[默认 %]: " new_user_host
   new_user_host=${new_user_host:-%}
   new_user_pwd_escaped=${new_user_pwd//\'/\'\'}
@@ -616,7 +636,8 @@ if [[ "${create_extra_user:-}" =~ ^[Yy]$ ]]; then
   print_success "已创建用户 $new_user@$new_user_host 并授予权限"
 fi
 
-print_section "7/7 完成与验证"
+
+print_section "---------------------- 7/7 完成与验证 ----------------------"
 
 # ---------------------- 重启服务并验证 ----------------------
 # 应用所有配置更改并显示最终状态
