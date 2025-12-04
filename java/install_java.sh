@@ -206,6 +206,39 @@ prompt_type() {
   done
 }
 
+prompt_feature() {
+  local input
+
+  # 若已通过环境变量指定，则先校验范围
+  if [[ -n "$JAVA_FEATURE" ]]; then
+    if [[ "$JAVA_FEATURE" =~ ^[0-9]+$ ]] && (( JAVA_FEATURE >= 8 && JAVA_FEATURE <= 25 )); then
+      print_info "使用环境变量 JAVA_FEATURE: $JAVA_FEATURE"
+      return 0
+    else
+      print_warning "无效的 JAVA_FEATURE=${JAVA_FEATURE}（支持 8-25），将进入交互式输入。"
+    fi
+  fi
+
+  echo "请选择要安装的 Java 主版本号 (8-25):"
+  echo "  示例: 8, 11, 17, 21 等，默认 17"
+  echo
+
+  while true; do
+    read -rp "请输入版本号 [8-25] (直接回车使用 17): " input
+    if [[ -z "$input" ]]; then
+      JAVA_FEATURE=17
+      break
+    fi
+
+    if [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 8 && input <= 25 )); then
+      JAVA_FEATURE="$input"
+      break
+    else
+      print_warning "版本号无效，仅支持 8-25，请重新输入。"
+    fi
+  done
+}
+
 # ---------------------- 下载 URL 生成 ----------------------
 
 build_download_url() {
@@ -312,9 +345,21 @@ download_java() {
   print_subsection "下载 Java 包"
   print_info "下载地址: $url"
   print_info "保存到 : $filepath"
+  echo
 
-  if ! wget -q --show-progress -O "$filepath" "$url"; then
+  # 使用 wget 显示下载进度，并在失败时输出详细原因
+  # -S         : 显示服务器响应头（便于排查 HTTP 状态码等问题）
+  # --progress : 强制使用进度条显示
+  # stderr 重定向到临时日志文件，失败时一起打印出来
+  local wget_log="${dest_dir}/wget_java.log"
+  if ! wget -S --progress=bar:force -O "$filepath" "$url" 2>"$wget_log"; then
     print_error "下载失败，请检查网络连接或发行版服务器。"
+    if [[ -s "$wget_log" ]]; then
+      echo
+      print_info "wget 失败详细信息如下（便于排查原因）:"
+      # 给错误日志每行加上前缀缩进，避免与正常输出混淆
+      sed 's/^/  /' "$wget_log" >&2 || true
+    fi
     exit 1
   fi
 
@@ -390,10 +435,11 @@ print_section "1/3 选择 Java 发行版与类型"
 
 prompt_vendor
 prompt_type
+prompt_feature
 
 print_success "选择发行版: $JAVA_VENDOR"
 print_success "选择类型  : $JAVA_TYPE"
-print_info "目标版本  : $JAVA_FEATURE (可通过 JAVA_FEATURE 环境变量调整)"
+print_success "目标版本  : $JAVA_FEATURE (可通过 JAVA_FEATURE 环境变量预设)"
 
 print_section "2/3 下载并安装 Java"
 
